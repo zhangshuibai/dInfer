@@ -134,6 +134,7 @@ hf download inclusionAI/LLaDA-MoE-7B-A1B-Instruct \
 ```
 
 #### 2) Convert to FusedMoE format
+**(For LLada2.0-mini/flash, this step should be skipped.)**
 
 Use the conversion tool to fuse MoE experts.
 
@@ -166,26 +167,24 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
 - **Benchmark-only (speed)** — scripts in `benchmarks/`
   - Measure throughput (TPS) only; predictions are saved under `--output_dir`; no automatic scoring.
   - Example 1 (LLaDA-MoE, threshold decoder, TP across 4 GPUs):
-
-```bash
-python benchmarks/benchmark_dataset.py \
-  --model_name inclusionAI/LLaDA-MoE-7B-A1B-Instruct \
-  --model_type llada_moe \
-  --dataset dataset_path \
-  --gen_len 1024 \
-  --block_length 64 \
-  --gpu 0,1,2,3 \
-  --output_dir runs/llada_moe_threshold \
-  --use_tp \
-  --parallel_decoding threshold \
-  --threshold 0.8 \
-  --cache dual \
-  --prefix_look 16 \
-  --after_look 16 \
-  --warmup_times 4 \
-  --cont_weight 0.3
-```
-
+  ```bash
+  python benchmarks/benchmark_dataset.py \
+    --model_name inclusionAI/LLaDA-MoE-7B-A1B-Instruct \
+    --model_type llada_moe \
+    --dataset dataset_path \
+    --gen_len 1024 \
+    --block_length 64 \
+    --gpu 0,1,2,3 \
+    --output_dir runs/llada_moe_threshold \
+    --use_tp \
+    --parallel_decoding threshold \
+    --threshold 0.8 \
+    --cache dual \
+    --prefix_look 16 \
+    --after_look 16 \
+    --warmup_times 4 \
+    --cont_weight 0.3
+  ```
   - Example 2 (threshold decoder, TP across 4 GPUs, LLaDA2-mini):
   - **Currently, we only support up to 4-way parallelism for LLaDA2 since the number of heads is 4.**
   ```
@@ -203,23 +202,22 @@ python benchmarks/benchmark_dataset.py \
     --cache prefix \
     --use_bd
   ```
-
   - Example 3 (threshold decoder, TP across 4 GPUs, LLaDA2-flash):
   -  **Currently, we only support up to 4-way parallelism for LLaDA2 since the number of heads is 4.**
-  ```
-  python benchmarks/benchmark_dataset.py \
-    --model_name inclusionAI/LLaDA2.0-flash-preview \
-    --model_type llada2 \
-    --dataset dataset_path \
-    --gen_len 2048 \
-    --block_length 32 \
-    --gpu 0,1,2,3 \
-    --output_dir runs/llada2_flash \
-    --use_tp \
-    --parallel_decoding threshold \
-    --threshold 0.9 \
-    --cache prefix \
-    --use_bd
+  ```shell
+    python benchmarks/benchmark_dataset.py \
+      --model_name inclusionAI/LLaDA2.0-flash-preview \
+      --model_type llada2 \
+      --dataset dataset_path \
+      --gen_len 2048 \
+      --block_length 32 \
+      --gpu 0,1,2,3 \
+      --output_dir runs/llada2_flash \
+      --use_tp \
+      --parallel_decoding threshold \
+      --threshold 0.9 \
+      --cache prefix \
+      --use_bd
   ```
  
   - Other entry points:
@@ -227,16 +225,16 @@ python benchmarks/benchmark_dataset.py \
     - Example 1 (threshold decoder, TP across 4 GPUs, LLaDA2-mini))
     ```shell
     python benchmarks/benchmark.py \
-    --model_name inclusionAI/LLaDA2.0-mini-preview \
-    --model_type llada2 \
-    --gen_len 2048 \
-    --block_length 32 \
-    --gpu 0,1,2,3 \
-    --use_tp \
-    --parallel_decoding threshold \
-    --threshold 0.9 \
-    --cache prefix \
-    --use_bd
+      --model_name inclusionAI/LLaDA2.0-mini-preview \
+      --model_type llada2 \
+      --gen_len 2048 \
+      --block_length 32 \
+      --gpu 0,1,2,3 \
+      --use_tp \
+      --parallel_decoding threshold \
+      --threshold 0.9 \
+      --cache prefix \
+      --use_bd
     ```
 
 
