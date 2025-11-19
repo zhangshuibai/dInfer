@@ -767,6 +767,7 @@ class LLaDA2Attention(nn.Module):
             max_position=config.max_position_embeddings,
             base=config.rope_theta,
             rope_scaling=config.rope_scaling,
+            dtype=torch.float32,
         )
 
         self.alt_stream = alt_stream
@@ -861,6 +862,11 @@ class LLaDA2Attention(nn.Module):
         if attention_mask is not None:
             if len(attention_mask.shape)==3:
                 attention_mask = attention_mask.unsqueeze(1)
+        key_padding_mask = (k.abs().sum(1, keepdim=True).sum(-1)>0.00001).unsqueeze(2).repeat(1, 1, q.shape[2], 1)
+        if attention_mask is not None:
+            attention_mask = attention_mask & key_padding_mask
+        else:
+            attention_mask = key_padding_mask
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
