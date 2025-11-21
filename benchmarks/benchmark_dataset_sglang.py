@@ -11,6 +11,7 @@ import random
 
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.layers.moe import initialize_moe_config
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp8Config
 from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
 from dinfer.decoding.diffusion_runner import ModelRunner
 from dinfer import BlockIteratorFactory, KVCacheFactory, BlockDiffusionLLM
@@ -81,6 +82,21 @@ def cut_eos(data, eos_id=156892):
     else:
         return data
 
+def load_quant_config(config, path):
+    """
+    read hf_quant_config.json from model path
+    if exist, set attribute config.quant_config
+    else, treat as a non-quantized model
+    """
+    quant_config_path = os.path.join(path, "hf_quant_config.json")
+    if os.path.exists(quant_config_path):
+        with open(quant_config_path, "r") as f:
+            quant_config_json = json.load(f)
+        quant_config = ModelOptFp8Config.from_config(quant_config_json)
+        setattr(config, "quant_config", quant_config)
+    else:
+        print(f"[Info] {quant_config_path} not found. Treating as a non-quantized model.")
+
 @ torch.no_grad()
 def main(world_size, rank, gpu_id, args):
     print('started', world_size, rank, gpu_id, args)
@@ -104,7 +120,11 @@ def main(world_size, rank, gpu_id, args):
 
     from sglang.srt.layers.dp_attention import initialize_dp_attention
     model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
-    server_args = ServerArgs(model_path=args.model_name, enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
+    if args.use_quant:
+        load_quant_config(model_config, args.model_name)
+        server_args = ServerArgs(model_path=args.model_name, quantization="modelopt_fp8",modelopt_quant="fp8", enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
+    else:
+        server_args = ServerArgs(model_path=args.model_name, enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
     try:
         from sglang.srt.server_args import set_global_server_args_for_scheduler
     except ImportError:
@@ -116,13 +136,17 @@ def main(world_size, rank, gpu_id, args):
         model_config=model_config,
     )
     initialize_moe_config(server_args)
-    model = LLaDA2SGLangLM(config=model_config, expert_map_path='.').eval()
+    if args.use_quant:
+        model = LLaDA2SGLangLM(config=model_config, quant_config = model_config.quant_config, expert_map_path='.').eval()
+    else:
+        model = LLaDA2SGLangLM(config=model_config, expert_map_path='.').eval()
     torch.set_default_dtype(torch.bfloat16)
     model.load_weights(args.model_name, device=device)
     initialize_moe_config(server_args)
     
     
     model = model.to(device)
+    model.after_processing()    # if model is quantized, use quant_method.process_weights_after_loading
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     max_length = max(input_lengths)+args.gen_len
     model = ModelRunner(model, device, server_args=server_args, max_length=max_length)
@@ -294,6 +318,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_shift', action='store_true')
     parser.add_argument('--use_bd', action='store_true')
     parser.add_argument('--model_type', type=str, default='mini')
+    parser.add_argument('--use_quant' ,action='store_true')
     parser.add_argument('--config', type=int, default=0)
     args = parser.parse_args()
     port = random.randint(40000, 60000)
