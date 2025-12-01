@@ -1391,8 +1391,8 @@ class LLaDA2SGLangLM(nn.Module):
         down_weight_scales = [{} for _ in range(num_layers)]
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
-        ep_rank = get_moe_expert_parallel_rank()
-        ep_size = get_moe_expert_parallel_world_size()
+        moe_tp_rank = get_moe_tensor_parallel_rank()
+        moe_tp_size = get_moe_tensor_parallel_world_size()
         for key, value in tqdm.tqdm(state_dict.items()):
             if ".mlp.experts." in key:
                 layer_id = int(key.split(".mlp.experts.")[0].split(".")[-1])
@@ -1429,11 +1429,8 @@ class LLaDA2SGLangLM(nn.Module):
             w2_input_scale = []
             w2_weight_scale = []
             if f"model.layers.{layer_id}.mlp.w1" in state_dict.keys():
-                ep_rank = get_tensor_model_parallel_rank()
-                ep_size = get_tensor_model_parallel_world_size()
-                size = divide(state_dict[f"model.layers.{layer_id}.mlp.w1"].shape[0], ep_size)
-                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = state_dict[f"model.layers.{layer_id}.mlp.w1"][per_gpu_expert_mapping[layer_id]].contiguous()
-                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = state_dict[f"model.layers.{layer_id}.mlp.w2"][per_gpu_expert_mapping[layer_id]].contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = self._tp_split(state_dict[f"model.layers.{layer_id}.mlp.w1"][per_gpu_expert_mapping[layer_id]], dim=1, rank=moe_tp_rank, world=moe_tp_size, is_w13=True).contiguous()
+                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = self._tp_split(state_dict[f"model.layers.{layer_id}.mlp.w2"][per_gpu_expert_mapping[layer_id]], dim=2, rank=moe_tp_rank, world=moe_tp_size).contiguous()
                 del new_state_dict[f"model.layers.{layer_id}.mlp.w1"]
                 del new_state_dict[f"model.layers.{layer_id}.mlp.w2"]
                 self.model.layers[layer_id].mlp.experts.expert_map_cpu = per_gpu_inverse_mapping[layer_id]
@@ -1459,8 +1456,8 @@ class LLaDA2SGLangLM(nn.Module):
                     w2_input_scale.append(down_input_scale)
                     w2_weight_scale.append(down_weight_scale)
 
-                w13_weight = torch.stack(w13_weight, dim=0)
-                w2_weight = torch.stack(w2_weight, dim=0)
+                w13_weight = self._tp_split(torch.stack(w13_weight, dim=0), dim=1, rank=moe_tp_rank, world=moe_tp_size, is_w13=True)
+                w2_weight = self._tp_split(torch.stack(w2_weight, dim=0), dim=2, rank=moe_tp_rank, world=moe_tp_size)
                 w13_input_scale = torch.stack(w13_input_scale, dim=0)
                 w13_weight_scale = torch.stack(w13_weight_scale, dim=0)
                 w2_input_scale = torch.stack(w2_input_scale, dim=0)
