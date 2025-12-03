@@ -8,7 +8,6 @@ from .utils import TokenArray, DistAlignedTokenArray, gather_sequence_block
 from .utils import calculate_op_num, BlockLoc
 
 logger = logging.getLogger(__name__)
-
 class DiffusionLLM:
     """ Diffusion LLM inference
     """
@@ -204,6 +203,7 @@ class BlockDiffusionRunner(BlockRunner):
             past_key_values, replace_position = None, None
 
         input_block_mask_number = 0
+        output = None
         while (block == decoder.mask_id).sum() > 0:
             unroll_k = int(max(min((block == decoder.mask_id).sum()//self.expected_tpf, self.maximum_unroll), 1))
             for unroll_i in range(unroll_k):
@@ -234,6 +234,11 @@ class BlockDiffusionRunner(BlockRunner):
                 # If all blocks have been decoded, we can jumpt out.
                 if len(seq_idx) == 0:
                     break
+
+        if output==None:
+            # force update if output is None
+            output = self.diff_iteration.forward(model, decoder, x, kv_cache, block, block_loc, block_id, pos_ids, attn_mask, past_key_values, replace_position, self.backend)
+
         if kv_cache is not None:
             self.cache_update_count += 1
             if input_block_mask_number > 0:
@@ -250,6 +255,7 @@ class BlockDiffusionRunner(BlockRunner):
         eos_idx = torch.any(orig_x[:, block_loc.start:block_loc.end] == decoder.eos_id, dim=1)
         if self.early_stop:
             orig_x[eos_idx, block_loc.end:] = decoder.eos_id
+
         return eos_idx
 
 class DiffusionIteration:
@@ -987,7 +993,7 @@ class BlockDiffusionLLM(DiffusionLLM):
         prefill_length = prefill_blocks * block_length
         prefill_length = max(prefill_length, block_length)
         self.block_runner.prefill(self.model, x[:, :prefill_length], kv_cache, pos_ids[:, :prefill_length], bd_attn_mask[:,:prefill_length,:prefill_length])
-        
+
         # We need to reset iter_no at the beginning of generating a sequence.
         self.diff_iteration.iter_no = 0
         for block_id, (block_loc, block) in enumerate(it):

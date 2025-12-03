@@ -28,6 +28,7 @@ dataset='openai_humaneval'
 
 FILE_PATH = Path(__file__).resolve()
 sample_path = FILE_PATH.with_name(f"{FILE_PATH.stem}_sample.json")
+batch_infer_path = FILE_PATH.with_name(f"{FILE_PATH.stem}_batch_infer.json")
 
 model = None
 gpu_id = 2
@@ -83,7 +84,29 @@ def run_bd(use_kvcache):
     
     return ans
 
+def batchinfer_diverse_length():
+  with open(batch_infer_path, "r") as f:
+    samples = json.load(f)
+    
+    batch_ids = []
+    prompt_len = []
+    for sample in samples:
+      prompt = [sample['prompt']]
+      prompt[0] = '<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>'+prompt[0]+'<|role_end|><role>ASSISTANT</role>' 
+      
+      input_ids = tokenizer(prompt)['input_ids']
+      input_ids = torch.tensor(input_ids)
+      prompt_len.append(input_ids.shape[1])
+      batch_ids.append(input_ids)
+
+    batch_input_ids= torch.zeros((len(batch_ids), max(prompt_len)), dtype=torch.long, device=device).fill_(156895) # fill mask_id
+    for j in range(len(batch_ids)):
+        batch_input_ids[j, :prompt_len[j]] = batch_ids[j].to(device)
+    dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=KVCacheFactory('prefix',is_bd_model=True), early_stop=True)
+    out = dllm.generate(batch_input_ids, gen_length=2048, block_length=32) #use 2048 for this test case
+
 def test_bd():
+  batchinfer_diverse_length()
   ans_cache = run_bd(use_kvcache=False)
   ans_wo_cache = run_bd(use_kvcache=True)
 
