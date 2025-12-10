@@ -202,7 +202,7 @@ model = AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True, torch_dt
 ## Contact us
 - Wechat Group
 <p align="left">
-  <img src="assets/wechat.JPG" alt="Wechat Group" width="150">
+  <img src="assets/Wechat.JPG" alt="Wechat Group" width="150">
 </p>
 
 ## Citation
