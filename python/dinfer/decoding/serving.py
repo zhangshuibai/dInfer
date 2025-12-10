@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 from vllm import distributed as vllm_dist
 from transformers import AutoConfig
+_original_from_pretrained = AutoConfig.from_pretrained
 from vllm.config import ParallelConfig
 from vllm.config import VllmConfig, set_current_vllm_config, get_current_vllm_config
 
@@ -15,8 +16,55 @@ from .utils import KVCacheFactory, BlockIteratorFactory
 from .generate_uniform import IterSmoothWithVicinityCacheDiffusionLLM, IterSmoothDiffusionLLM, VicinityCacheDiffusionLLM, BlockWiseDiffusionLLM, BlockDiffusionLLM
 from ..model.modeling_fused_olmoe import FusedOlmoeForCausalLM
 from ..model.modeling_llada import LLaDAModelLM
+import time
+import json
+import sys
+from transformers.configuration_utils import PretrainedConfig
 
 logger = logging.getLogger(__name__)
+
+def load_local_config(model_dir):
+    # load config.json from model_path
+    cfg_path = os.path.join(model_dir, "config.json")
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    data.pop("auto_map", None)
+
+    # dtype rename
+    if "torch_dtype" in data and "dtype" not in data:
+        td = data["torch_dtype"]
+        if isinstance(td, str):
+            m = {
+                "float16": torch.float16, "fp16": torch.float16,
+                "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
+                "float32": torch.float32, "fp32": torch.float32,
+            }
+            data["dtype"] = m.get(td.lower(), td)
+        else:
+            data["dtype"] = td
+
+    # return with PretrainedConfig format.
+    cfg = PretrainedConfig.from_dict(data)
+    cfg.name_or_path = model_dir
+    return cfg
+
+# When multiple workers run under DP/TP, concurrent AutoConfig calls can cause race conditions during config loading due to compilation overhead. 
+# To avoid this, we override AutoConfig to directly load and convert config.json from the model path.
+def _patched(cls, name_or_path, *args, **kwargs):
+    subfolder = kwargs.get("subfolder")
+    local_dir = os.path.join(name_or_path, subfolder) if subfolder else name_or_path
+    assert os.path.isdir(local_dir), f"Model path does not exist: {local_dir}"
+    cfg_file = os.path.join(local_dir, "config.json")
+    assert os.path.isfile(cfg_file), f"Config.json file does not exist: {cfg_file}"
+    
+    try:
+        return load_local_config(local_dir)
+    except Exception as e:
+        # Fall back to original loader on local config failure.
+        logger.warning(f"Failed to load config from local path '{local_dir}': {e}")
+        logger.warning("Falling back to Hugging Face's original loader...")
+    
+    return _original_from_pretrained(name_or_path, *args, **kwargs)
 
 class SamplingParams:
     """ The parameters used for sampling a sequence.
@@ -141,7 +189,6 @@ def _sglang_llada2_server_process(model_path, sample_params, world_size, rank, g
     torch.cuda.set_device(gpu_id)
     device = torch.device(gpu_id)
     logger.info(f'start v2 server. server port: {master_port}')
-
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = str(master_port)
     from sglang.srt import distributed
@@ -152,8 +199,15 @@ def _sglang_llada2_server_process(model_path, sample_params, world_size, rank, g
     from ..model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
     from .diffusion_runner import ModelRunner
     from sglang.srt.layers.dp_attention import initialize_dp_attention
+
+    # override AutoConfig to directly load and convert config.json from the model path
+    AutoConfig.from_pretrained = classmethod(_patched)
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    server_args = ServerArgs(model_path=model_path, enable_dp_attention=True, trust_remote_code=True, tp_size=world_size, dp_size = 1, pp_size = 1)
+
+    # ServerArgs call autoconfig in sglang/srt/utils/hf_transformers_utils.py. We use overrided autoconbfig here.
+    server_args = ServerArgs(model_path=model_path, enable_dp_attention=True, trust_remote_code=True, tp_size=world_size, dp_size = 1, pp_size = 1) 
+
+
     try:
         from sglang.srt.server_args import set_global_server_args_for_scheduler
     except ImportError:
@@ -347,6 +401,7 @@ class ServerHandle:
             logger.info(f'start server group on GPU {gpus}, server port: {server_port}')
             self.groups[-1].start_server(model_path, model_type, sample_params, server_port, gpus, backend=backend)
             gpu = gpus[-1] + 1
+            
 
     def is_running(self):
         return len(self.groups) != 0
