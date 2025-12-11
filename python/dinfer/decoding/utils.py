@@ -91,6 +91,7 @@ class TokenArray:
         if self.batch_size == 1:
             return self.data[self.data != self.eos_id].unsqueeze(0)
         else:
+            self.data[self.data == self.mask_id] = self.eos_id
             return self.data
 
     def select_seqs(self, idx):

@@ -143,7 +143,9 @@ def main(world_size, rank, gpu_id, args):
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     max_length = max(input_lengths)+args.gen_len
     aligned_lengths = np.unique([max(args.block_length, min(length//args.block_length*args.block_length, args.prefilling_limit)) for length in input_lengths])
-    model = ModelRunner(model, device, server_args=server_args, max_length=max_length, prefill_lengths=aligned_lengths, enable_cuda_graph=True, supported_batch_sizes=[args.batch_size])
+    aligned_lengths = [int(length) for length in aligned_lengths]
+    supported_batch_sizes = [2**i for i in range(int(np.log2(args.mini_batch_size))+1)]
+    model = ModelRunner(model, device, server_args=server_args, max_length=max_length, prefill_lengths=aligned_lengths, enable_cuda_graph=True, supported_batch_sizes=supported_batch_sizes, use_cross_block=args.batch_size==1)
 
 
     if args.parallel_decoding == 'threshold':
@@ -174,10 +176,9 @@ def main(world_size, rank, gpu_id, args):
             else:
                 dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
     else:
-        dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True, 
-                                 maximum_unroll=1, expected_tpf=15, backend='sglang', prefilling_limit=args.prefilling_limit)
+        dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), cache_factory=cache_factory, early_stop=True, maximum_unroll=1, expected_tpf=15, backend='sglang', mini_batch_size=args.mini_batch_size, prefilling_limit=args.prefilling_limit, use_naive_batching=args.use_naive_batching)
     # warmup for decoding algorithms
-    input_ids = torch.arange(64, dtype=torch.long, device=device).unsqueeze(0)
+    input_ids = torch.randint(0, 100000, (args.mini_batch_size, 64), dtype=torch.long, device=device)
     dllm.generate(input_ids, gen_length=args.gen_len, block_length=args.block_length)
     batch_size = args.batch_size
     
@@ -226,23 +227,25 @@ def main(world_size, rank, gpu_id, args):
             total_time += sample_time
             batch_token_number = 0
             for j in range(input_ids.shape[0]):
-                token_number = int((out[j]!=156892).sum() - sorted_input_ids[i+j].shape[1])
+                token_number = int(((out[j]!=156892)&(out[j]!=156895)).sum() - sorted_input_ids[i+j].shape[1])
                 batch_token_number += token_number
                 token_numbers.append(token_number)
-            tpf = batch_token_number/nfe/batch_size
-            tps = batch_token_number/sample_time
-            fps = nfe/sample_time
-            tpfs.append(tpf)
-            tpss.append(tps)
-            fpss.append(fps)
+
+            for j in range(input_ids.shape[0]):
+                tpf = token_number/nfe
+                tps = batch_token_number/sample_time
+                fps = nfe/sample_time
+                tpfs.append(tpf)
+                tpss.append(tps)
+                fpss.append(fps)
             if rank == 0:
                 print(f'[iter {i:4d}]nfe={nfe:4d}, token number={batch_token_number:4d}, sample_time={sample_time:2.4f}, fps={fps:4.2f}({np.mean(fpss):4.2f}),tpf={tpf:2.2f}({np.mean(tpfs):4.2f}), tps={tps:4.2f}({np.mean(tpss):4.2f})')
                 if wi==0 and i<5:
                     for j in range(min(input_ids.shape[0], 4)):
                         answer = cut_eos(out[j, sorted_input_ids[i+j].shape[1]:].unsqueeze(0))[0]
                         # print(answer)
-                        print(f'generated text {j}: {tokenizer.decode(answer, skip_special_tokens=False)}')
-            total_token += token_number
+                        print(f'generated text {j}, length: {len(answer)}, content: {tokenizer.decode(answer, skip_special_tokens=False)}')
+            total_token += batch_token_number
 
         total_token = total_token
 
@@ -256,11 +259,11 @@ def main(world_size, rank, gpu_id, args):
     original_order_token_numbers = [None] * len(all_input_ids)
 
     for i, original_idx in enumerate(sorted_indices):
-        original_order_outputs[original_idx] = outputs[i//batch_size]
-        original_order_tpfs[original_idx] = tpfs[i//batch_size]
-        original_order_tpss[original_idx] = tpss[i//batch_size]
-        original_order_fpss[original_idx] = fpss[i//batch_size]
-        original_order_token_numbers[original_idx] = token_numbers[i//batch_size]
+        original_order_outputs[original_idx] = outputs[i]
+        original_order_tpfs[original_idx] = tpfs[i]
+        original_order_tpss[original_idx] = tpss[i]
+        original_order_fpss[original_idx] = fpss[i]
+        original_order_token_numbers[original_idx] = token_numbers[i]
 
     outputs = original_order_outputs
     tpfs = original_order_tpfs
@@ -294,8 +297,8 @@ import argparse
 if __name__ == '__main__':
     torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default='')
-    parser.add_argument('--dataset', type=str, default='')
+    parser.add_argument('--model_name', type=str, default='/data/dulun/models/dllm-mini-final/public/dllm-mini/block-diffusion-sft-2k-v2-full-bd/LLaDA2-mini-preview-ep4-v0')
+    parser.add_argument('--dataset', type=str, default='/mnt/dllm/weilanning/bd_prompt/openai_humaneval.json')
     parser.add_argument('--gpu', type=str, default='0,1,2,3')
     parser.add_argument('--batch_size', type=int, default=1)
     parser.add_argument('--gen_len', type=int, default=1024)
@@ -316,12 +319,20 @@ if __name__ == '__main__':
     parser.add_argument('--use_bd', action='store_true')
     parser.add_argument('--model_type', type=str, default='mini')
     parser.add_argument('--ep_size', type=int, default=1)
-    parser.add_argument('--prefilling_limit', type=int, default=256)
-    parser.add_argument('--use_quant' ,action='store_true')
+    parser.add_argument('--mini_batch_size', type=int, default=4)
+    parser.add_argument('--use_quant', action='store_true')
+    parser.add_argument('--prefilling_limit', type=int, default=128)
     parser.add_argument('--config', type=int, default=0)
+    parser.add_argument('--use_naive_batching', action='store_true')
+
+
     args = parser.parse_args()
     port = random.randint(40000, 60000)
     args.port = str(port)
+    if args.batch_size==1:
+        args.use_naive_batching = True
+    if args.use_naive_batching:
+        args.mini_batch_size = args.batch_size
 
     if args.config == 1:
         args.cache = ''
@@ -443,6 +454,15 @@ if __name__ == '__main__':
         args.threshold = 0.95
         args.warmup_times = 0
         args.use_bd=True
+    elif args.config == 42:
+        args.cache = 'prefix'
+        args.parallel_decoding = 'threshold'
+        args.prefix_look = 0
+        args.after_look = 0
+        args.threshold = 0.9
+        args.warmup_times = 0
+        args.use_bd=True
+        args.block_length=32
     elif args.config == 43:
         args.cache = 'prefix'
         args.parallel_decoding = 'threshold'

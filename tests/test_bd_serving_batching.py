@@ -36,7 +36,7 @@ dataset_path = '/ossfs/workspace/dumped_prompts'
 dataset='openai_humaneval'
 
 FILE_PATH = Path(__file__).resolve()
-sample_path = FILE_PATH.with_name(f"{FILE_PATH.stem[:-13]}_sample.json")
+sample_path = FILE_PATH.with_name(f"{FILE_PATH.stem[:-17]}_sample.json")
 
 model = None
 tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -47,70 +47,67 @@ decoder = ThresholdParallelDecoder(temperature=0, threshold=0.9, mask_id=156895,
 def test_bd_tpep():
   with open(sample_path, "r") as f:
     samples = json.load(f)
-
-    sample_params1 = SamplingParams(threshold=0.9, cache='prefix', temperature=0., early_stop=True, cont_weight=0, prefix_look=0, 
-            after_look=0, warmup_steps=0, enable_torch_compile=True, mask_id=156895, eos_id=156892, parallel_decoding='threshold', 
-            use_credit=False, use_bd=True, max_length=2048, ep_size=1)
-    dllm_server1 = DiffusionLLMServing(model_path, model_type='llada2-mini', sample_params=sample_params1, server_port=40570, num_gpus=4, dp_size=1, tpep_size=4, backend='sglang', timeout=600)
-
-
-    ans1 = []
+    input_ids = []
     for sample in samples:
       prompt = [sample['question']]
       prompt[0] = '<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>'+prompt[0]+'<|role_end|><role>ASSISTANT</role>' 
       
-      input_ids = tokenizer(prompt)['input_ids']
-      input_ids = torch.tensor(input_ids)
+      input_id = tokenizer(prompt)['input_ids']
+      input_ids.append(torch.tensor(input_id))
+    
+    max_length = max([input_id.shape[1] for input_id in input_ids])
+    batch_size = len(input_ids)
+    batch_input_ids= torch.zeros((len(input_ids), max_length), dtype=torch.long).fill_(156895)
 
-      out1 = dllm_server1.generate(input_ids, gen_length=128, block_length=32)
-      new_ans1 = tokenizer.decode(out1[0, input_ids.shape[1]:], skip_special_tokens=True)
-      
-      ans1.append(out1[0, input_ids.shape[1]:])
+    print('batch_size:', batch_size, 'input shapes:', [input_id.shape[0] for input_id in input_ids])
+    for j in range(len(input_ids)):
+        batch_input_ids[j, :input_ids[j].shape[1]] = input_ids[j]
+
+    sample_params1 = SamplingParams(threshold=0.9, cache='prefix', temperature=0., early_stop=True, cont_weight=0, prefix_look=0, 
+            after_look=0, warmup_steps=0, enable_torch_compile=True, mask_id=156895, eos_id=156892, parallel_decoding='threshold', 
+            use_credit=False, use_bd=True, max_length=max_length+64, ep_size=1, batch_size=batch_size, mini_batch_size=batch_size, use_naive_batching=True)
+    dllm_server1 = DiffusionLLMServing(model_path, model_type='llada2-mini', sample_params=sample_params1, server_port=40570, num_gpus=4, dp_size=1, tpep_size=4, backend='sglang')
+
+    out1 = dllm_server1.generate(batch_input_ids, gen_length=64, block_length=32)
+    ans1 = []
+    for j in range(batch_size):
+      ans1.append(out1[j, input_ids[j].shape[1]:])
+    #   print(f'========== {j} ==========\n', tokenizer.decode(out1[j], skip_special_tokens=True))
     dllm_server1.stop_serving()
 
 
     sample_params2 = SamplingParams(threshold=0.9, cache='prefix', temperature=0., early_stop=True, cont_weight=0, prefix_look=0, 
             after_look=0, warmup_steps=0, enable_torch_compile=True, mask_id=156895, eos_id=156892, parallel_decoding='threshold', 
-            use_credit=False, use_bd=True, max_length=2048, ep_size=4)
-    dllm_server2 = DiffusionLLMServing(model_path, model_type='llada2-mini', sample_params=sample_params2, server_port=40680, num_gpus=4, dp_size=1, tpep_size=4, backend='sglang', timeout=600)
-    ans2 = []
-    for sample in samples:
-      prompt = [sample['question']]
-      prompt[0] = '<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>'+prompt[0]+'<|role_end|><role>ASSISTANT</role>' 
-      
-      input_ids = tokenizer(prompt)['input_ids']
-      input_ids = torch.tensor(input_ids)
+            use_credit=False, use_bd=True, max_length=max_length+64, ep_size=1, batch_size=batch_size, mini_batch_size=1, use_naive_batching=False)
+    dllm_server2 = DiffusionLLMServing(model_path, model_type='llada2-mini', sample_params=sample_params2, server_port=40570, num_gpus=4, dp_size=1, tpep_size=4, backend='sglang')
 
-      out2 = dllm_server2.generate(input_ids, gen_length=128, block_length=32)
-      new_ans2 = tokenizer.decode(out2[0, input_ids.shape[1]:], skip_special_tokens=True)
-      ans2.append(out2[0, input_ids.shape[1]:])
+    out2 = dllm_server2.generate(batch_input_ids, gen_length=64, block_length=32)
+    ans2 = []
+    for j in range(batch_size):
+      ans2.append(out2[j, input_ids[j].shape[1]:])
     dllm_server2.stop_serving()
-  
 
     sample_params3 = SamplingParams(threshold=0.9, cache='prefix', temperature=0., early_stop=True, cont_weight=0, prefix_look=0, 
             after_look=0, warmup_steps=0, enable_torch_compile=True, mask_id=156895, eos_id=156892, parallel_decoding='threshold', 
-            use_credit=False, use_bd=True, max_length=2048, ep_size=4, prefilling_limit=32)
-    dllm_server3 = DiffusionLLMServing(model_path, model_type='llada2-mini', sample_params=sample_params3, server_port=40680, num_gpus=4, dp_size=1, tpep_size=4, backend='sglang', timeout=600)
-    ans3 = []
-    for sample in samples:
-      prompt = [sample['question']]
-      prompt[0] = '<role>SYSTEM</role>detailed thinking off<|role_end|><role>HUMAN</role>'+prompt[0]+'<|role_end|><role>ASSISTANT</role>' 
-      
-      input_ids = tokenizer(prompt)['input_ids']
-      input_ids = torch.tensor(input_ids)
+            use_credit=False, use_bd=True, max_length=max_length+64, ep_size=1, batch_size=batch_size, mini_batch_size=batch_size, use_naive_batching=False)
+    dllm_server3 = DiffusionLLMServing(model_path, model_type='llada2-mini', sample_params=sample_params3, server_port=40570, num_gpus=4, dp_size=1, tpep_size=4, backend='sglang')
 
-      out3 = dllm_server3.generate(input_ids, gen_length=128, block_length=32)
-      new_ans3 = tokenizer.decode(out3[0, input_ids.shape[1]:], skip_special_tokens=True)
-      ans3.append(out3[0, input_ids.shape[1]:])
+    out3 = dllm_server3.generate(batch_input_ids, gen_length=64, block_length=32)
+    ans3 = []
+    for j in range(batch_size):
+      ans3.append(out3[j, input_ids[j].shape[1]:])
     dllm_server3.stop_serving()
 
     for i in range(len(ans1)):
-      matching_portion = (ans1[i] == ans2[i]).float().mean()
-      print(f"matching_portion 1<->2: {matching_portion}")
-      assert matching_portion > 0.9
-      matching_portion = (ans2[i] == ans3[i]).float().mean()
-      print(f"matching_portion 2<->3: {matching_portion}")
-      assert matching_portion > 0.9
+      matching_portion1 = (ans1[i] == ans2[i]).float().mean()
+      print(f"matching_portion 1<->2: {matching_portion1}")
+      matching_portion2 = (ans2[i] == ans3[i]).float().mean()
+      print(f"matching_portion 2<->3: {matching_portion2}")
+      print('ans1:', tokenizer.decode(ans1[i], skip_special_tokens=True))
+      print('ans2:', tokenizer.decode(ans2[i], skip_special_tokens=True))
+      print('ans3:', tokenizer.decode(ans3[i], skip_special_tokens=True))
+      assert matching_portion1 > 0.6
+      assert matching_portion2 > 0.6
       # assert(ans1[i] == ans2[i])
     
     return

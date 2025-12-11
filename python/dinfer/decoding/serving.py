@@ -3,6 +3,7 @@ import logging
 import multiprocessing as mp
 import traceback
 from queue import Empty
+import numpy as np
 import torch
 import torch.distributed as dist
 from vllm import distributed as vllm_dist
@@ -99,7 +100,8 @@ class SamplingParams:
     """
     def __init__(self, threshold=0.9, low_threshold=0.6, cache='dual', temperature=0., early_stop=True, cont_weight=0.3,
             prefix_look=16, after_look=16, warmup_steps=4, enable_torch_compile=True, mask_id=156895, eos_id=156892, 
-            parallel_decoding='threshold', use_credit=False, use_bd=True, max_length=4096, ep_size=1, prefilling_limit=256):
+            parallel_decoding='threshold', use_credit=False, use_bd=True, max_length=4096, ep_size=1, prefilling_limit=256,
+            mini_batch_size=1, batch_size=1, use_naive_batching=False):
         self.threshold = threshold
         self.low_threshold = low_threshold
         self.cache = cache
@@ -118,6 +120,9 @@ class SamplingParams:
         self.max_length = max_length
         self.ep_size = ep_size
         self.prefilling_limit = prefilling_limit
+        self.mini_batch_size = mini_batch_size
+        self.batch_size = batch_size
+        self.use_naive_batching = use_naive_batching
 
 def init_generator(model, sample_params, backend='vllm', max_length=4096):
     if sample_params.parallel_decoding == 'threshold':
@@ -155,8 +160,8 @@ def init_generator(model, sample_params, backend='vllm', max_length=4096):
                     early_stop=sample_params.early_stop)
     else:
         dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True, use_block_diffusion=True), 
-            cache_factory=cache_factory, early_stop=sample_params.early_stop, maximum_unroll=2, expected_tpf=15, backend=backend, 
-            prefilling_limit=sample_params.prefilling_limit)
+            cache_factory=cache_factory, early_stop=sample_params.early_stop, maximum_unroll=1, expected_tpf=15, backend=backend, 
+            prefilling_limit=sample_params.prefilling_limit, mini_batch_size=sample_params.mini_batch_size, use_naive_batching=sample_params.use_naive_batching)
 
     return dllm
 
@@ -227,7 +232,11 @@ def _sglang_llada2_server_process(model_path, sample_params, world_size, rank, g
     
     model = model.to(device)
     max_length = sample_params.max_length
-    model = ModelRunner(model, device, server_args=server_args, max_length=max_length, enable_compile=sample_params.enable_torch_compile)
+    prefill_lengths=[32*i for i in range(1, sample_params.prefilling_limit//32+1)]
+    supported_batch_sizes = [2**i for i in range(int(np.log2(sample_params.mini_batch_size))+1)]
+    model = ModelRunner(model, device, server_args=server_args, max_length=max_length, prefill_lengths=prefill_lengths, 
+                        enable_compile=sample_params.enable_torch_compile, supported_batch_sizes=supported_batch_sizes, 
+                        use_cross_block=sample_params.batch_size==1)
 
     dllm = init_generator(model, sample_params, backend='sglang', max_length=max_length)
     generate(dllm, model.device, req_q=q, res_q=res_q)
@@ -378,16 +387,27 @@ class ServerGroup:
 class ServerHandle:
     def __init__(self):
         self.groups = []
+        self.need_response = 0
 
     def add_requests(self, reqs):
         prompts, gen_length, block_length = reqs
-        assert len(self.groups) == prompts.shape[0], 'We cannot only use DP to support batch size > 1.'
-        for i, prompt in enumerate(prompts):
-            self.groups[i].add_request((prompt.unsqueeze(0), gen_length, block_length))
+        self.need_response = 0
+        # assert len(self.groups) == prompts.shape[0], 'We cannot only use DP to support batch size > 1.'
+        if len(self.groups) == prompts.shape[0]:
+            for i, prompt in enumerate(prompts):
+                self.groups[i].add_request((prompt.unsqueeze(0), gen_length, block_length))
+            self.need_response = len(prompts)
+        else:
+            partial_data = torch.chunk(prompts, len(self.groups), dim=0)
+            for i in range(len(partial_data)):
+                self.groups[i].add_request((partial_data[i], gen_length, block_length))
+            self.need_response = len(partial_data)
+
 
     def get_responses(self, timeout=None):
         res = []
-        for group in self.groups:
+        for i in range(self.need_response):
+            group = self.groups[i]
             res.append(group.get_response(timeout=timeout))
         return res
 
@@ -470,13 +490,15 @@ class DiffusionLLMServing:
         handle.add_requests((prompts, gen_length, block_length))
         rets = handle.get_responses(timeout=self.timeout)
         max_len = max([tensor.shape[1] for (tensor, _) in rets])
-        res = torch.zeros(len(rets), max_len, dtype=rets[0][0].dtype)
+        total_batch_size = sum([tensor.shape[0] for (tensor, _) in rets])
+        res = torch.zeros(total_batch_size, max_len, dtype=rets[0][0].dtype)
         res[:] = self.sample_params.eos_id
         sum_num_forwards = 0
+        p = 0
         for i, (tensor, num_forwards) in enumerate(rets):
             sum_num_forwards = max(sum_num_forwards, num_forwards)
             out_len = int(tensor.shape[1])
-            res[i, :out_len] = tensor[0]
+            res[p:p+len(tensor), :out_len] = tensor
         self.num_forwards = sum_num_forwards
         return res
 

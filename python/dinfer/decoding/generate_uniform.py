@@ -8,6 +8,12 @@ from .utils import TokenArray, DistAlignedTokenArray, gather_sequence_block
 from .utils import calculate_op_num, BlockLoc
 
 logger = logging.getLogger(__name__)
+
+def align_exp2(x: torch.Tensor):
+    assert x.ndim == 0 and x.item() >= 0
+    shift = 0 if x == 0 else int(torch.floor(torch.log2(x.to(torch.float64)))) + 1
+    return 1 << shift
+
 class DiffusionLLM:
     """ Diffusion LLM inference
     """
@@ -950,6 +956,30 @@ class BlockDiffusionLLMAttnmask(DiffusionLLM):
         logger.info(f'The number of diffusion iterations: {self.num_forwards}')
         return x.get_generated_tokens()
 
+
+def gather_blocks(x: torch.Tensor, idx: torch.Tensor, block_length: int) -> torch.Tensor:
+    # Gather blocks from a batch to form a mini-batch input ids, select on block from each sequence,
+    # idx is a 1-d tensor indicating the block start position of each sequence, block length indecates the length of a block
+    n, L = x.shape
+    offsets = torch.arange(block_length, device=x.device).unsqueeze(0)          # (1, block_length)
+    indices = idx.unsqueeze(1) + offsets                                       # (n, block_length)
+    blocks = torch.gather(x, dim=1, index=indices)
+    return blocks
+
+def select_batch_sequences_by_mask_number(x, valid_flag, mask_id, batch_size):
+    # Select sequences to build a mini-batch, using sequences with most mask tokens
+    cand_idx = torch.nonzero(valid_flag, as_tuple=False).squeeze(1)  # shape (N,)
+    _, sorted_order = torch.sort(-(x.data[cand_idx]==mask_id).sum(dim=1), stable=False)  
+    top_order = sorted_order[:batch_size] 
+    return cand_idx[top_order]
+
+def select_batch_sequences_by_order(x, valid_flag, mask_id, batch_size):
+    # Select sequences to build a mini-batch, selecting simply by sequence order
+    return torch.nonzero(valid_flag, as_tuple=True)[0][:batch_size]
+
+select_prefilling_batch_sequences = select_batch_sequences_by_mask_number
+select_decoding_batch_sequences = select_batch_sequences_by_mask_number
+
 class BlockDiffusionLLM(DiffusionLLM):
     """ Diffusion LLM inference
 
@@ -967,9 +997,25 @@ class BlockDiffusionLLM(DiffusionLLM):
         The decoder that decodes the tokens from the logits computed by the Transformer model
     iterator_facotry : IteratorFactory
         The factory class that generates the iterator on the input token array.
-
+    cache_factory : CacheFactory
+        The factory class that creates the KV-cache.
+    early_stop : bool, default=True
+        If True, generation of each sequence stops as soon as it has generated the EOS token.
+    maximum_unroll : int, default=1
+        Maximum number of forwards to unroll at a time, to reduce cuda graph overhead.
+    expected_tpf : int, default=15
+        Expected tokens per forward pass, used for controling unrolling).
+    backend : str, default='vllm'
+        Inference backend. Options include 'vllm', 'sglang'
+    mini_batch_size : int, default=4
+        Size of mini-batches used in dynamic batching.
+    prefilling_limit : int, default=128
+        Maximum length for prefilling the KV-cache, rest of the input prompt will be prefilled block by block.
+    use_naive_batching : bool, default=True
+        If True, uses naive batching; otherwise, uses dynamic batching.
     """
-    def __init__(self, model, decoder, iterator_factory, cache_factory, early_stop=True, maximum_unroll=4, expected_tpf=8, backend='vllm', prefilling_limit=256):
+    def __init__(self, model, decoder, iterator_factory, cache_factory, early_stop=True, maximum_unroll=1, expected_tpf=15, backend='vllm', 
+                 mini_batch_size=4, prefilling_limit=128, use_naive_batching=True):
         self.model = model
         self.decoder = decoder
         self.iterator_factory = iterator_factory
@@ -978,7 +1024,13 @@ class BlockDiffusionLLM(DiffusionLLM):
         self.block_runner = BlockDiffusionRunner(self.diff_iteration, early_stop, maximum_unroll, expected_tpf, backend)
         self.early_stop = early_stop
         self.backend = backend
+        self.mini_batch_size = mini_batch_size
         self.prefilling_limit = prefilling_limit
+        self.use_naive_batching = use_naive_batching
+        if self.use_naive_batching or self.backend!='sglang':
+            self.generate = self.naive_batching_generate
+        else:
+            self.generate = self.dynamic_batching_generate
 
     @property
     def num_forwards(self):
@@ -989,17 +1041,17 @@ class BlockDiffusionLLM(DiffusionLLM):
         return self.diff_iteration.cache_updates
 
     @ torch.no_grad()
-    def generate(self, prompt, gen_length=128, block_length=128):
+    def naive_batching_generate(self, prompt, gen_length=128, block_length=128):
         ''' Generate tokens with diffusion iterations block by block.
         '''
         # recalculate gen length and init iteratory
         # TODO(dulun): the implementation align with original bd decoder implementation.
         # We may need to refine to let users control the gen_length.
         batch_size = prompt.shape[0]
-        prompt_length=prompt.shape[1]
+        prompt_length = prompt.shape[1]
         num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
         total_length = num_blocks * block_length
-        new_gen_length=total_length-prompt_length
+        new_gen_length = total_length-prompt_length
         
         mask_length = (max(self.cache_factory.max_length, prompt_length + gen_length)+block_length-1)//block_length*block_length
         attn_mask_num_blocks = mask_length // block_length
@@ -1033,6 +1085,123 @@ class BlockDiffusionLLM(DiffusionLLM):
             decode_compl = self.block_runner.decode(self.model, self.decoder, x, kv_cache, block, block_loc, block_id, pos_ids, bd_attn_mask, block_length, cross_block_attn_mask)
             if torch.all(decode_compl) and self.early_stop:
                 break
+        logger.info(f'The number of diffusion iterations: {self.num_forwards}')
+        return x.get_generated_tokens()
+
+    @ torch.no_grad()
+    def dynamic_batching_generate(self, prompt, gen_length=128, block_length=128):
+        ''' Generate tokens with dynamic batching
+        '''
+        assert self.cache_factory is not None
+        device = self.model.device
+        mask_id = self.decoder.mask_id
+        batch_size = prompt.shape[0]
+        prompt_length = prompt.shape[1]
+        num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
+        total_length = num_blocks * block_length
+        new_gen_length = total_length-prompt_length
+        
+        mask_length = (max(self.cache_factory.max_length, prompt_length + gen_length)+block_length-1)//block_length*block_length
+        attn_mask_num_blocks = mask_length // block_length
+        mini_batch_size = self.mini_batch_size
+
+        # Prepare block_mask and position IDs
+        block_mask = torch.tril(torch.ones(attn_mask_num_blocks, attn_mask_num_blocks, device=device, dtype=torch.bool))
+        bd_attn_mask = block_mask.repeat_interleave(block_length, dim=0)\
+                                        .repeat_interleave(block_length, dim=1).unsqueeze(0).repeat(mini_batch_size, 1, 1)
+        pos_ids = torch.arange(total_length, device=device).unsqueeze(0).repeat(batch_size, 1)
+
+        x = TokenArray(prompt, new_gen_length, mask_id, self.decoder.eos_id, device)
+
+        prefilling_limit = self.prefilling_limit
+        non_mask_number = (prompt != mask_id).sum(dim=-1)
+        decoding_start = ((non_mask_number) // block_length) * block_length
+        decoding_start = decoding_start.clip(0, prefilling_limit)
+
+        prefilling_lengths = decoding_start.clip(0, prefilling_limit)
+
+        # Initialize KV cache
+        num_layers = self.model.model.config.num_hidden_layers
+        num_kv_heads = self.model.model.config.num_key_value_heads
+        num_heads = self.model.model.config.num_attention_heads
+        head_dim = self.model.model.config.hidden_size // num_heads
+        self.past_key_values = torch.zeros((num_layers, 2, batch_size, max(1, num_kv_heads//torch.distributed.get_world_size()), 
+                                            self.model.max_length, head_dim), dtype=torch.bfloat16, device=device)
+
+        # === PREFILLING PHASE ===
+	      # Prefill the KV cache with the initial prompt tokens up to prefilling_limit
+        prefilling_flag = prefilling_lengths>0
+        while torch.any(prefilling_flag):
+            prefilling_seq_ids = select_prefilling_batch_sequences(x, prefilling_flag, mask_id, mini_batch_size)
+            prefilling_length = max(prefilling_lengths[prefilling_seq_ids])
+
+            prefilling_x = x.select_seqs(prefilling_seq_ids)
+            output = self.model(prefilling_x[:, :prefilling_length].clone(memory_format=torch.contiguous_format), use_cache=True, 
+                                attention_mask=bd_attn_mask[:len(prefilling_seq_ids), :prefilling_length, 
+                                                            :prefilling_length].clone(memory_format=torch.contiguous_format), 
+                                position_ids=pos_ids[prefilling_seq_ids,:prefilling_length].clone(memory_format=torch.contiguous_format))
+            inner_shape = output.past_key_values[0].shape
+            prefilling_kv = torch.stack(output.past_key_values, dim=0).reshape(num_layers, 2, *inner_shape)
+            for id, sample_prefilling_length in enumerate(prefilling_lengths[prefilling_seq_ids]):
+                self.past_key_values[:, :, prefilling_seq_ids[id], :, :sample_prefilling_length] = prefilling_kv[:, :, id, :, :sample_prefilling_length]
+                self.past_key_values[:, :, prefilling_seq_ids[id], :, sample_prefilling_length:] = 0
+            self.diff_iteration.num_forwards +=1
+            prefilling_flag[prefilling_seq_ids] = False
+            
+        # === DECODING PHASE ===
+        # This loop performs block-by-block block diffusion generation using dynamic batching over sequences that are still active.
+        # The outer loop iterates over varying cache lengths, progressively expanding the attention context.
+        # The inner loop handles dynamic batching for sequences that fit within the current cache capacity.
+        # In each inner iteration:
+        #   we first select sequences and build batch for forward pass.
+        #   Then logits are used to update sequences, and sequences with finished blocks update the KV cache.
+        #   Completed sequences (generated EOS) are marked to exit early if enabled.
+        decoding_flag = (decoding_start+block_length)<=total_length
+        
+        while torch.any(decoding_flag):
+            # Dynamically adjust cache size based on the earliest decoding position
+            current_cache_length = max(128, align_exp2(min(decoding_start[decoding_flag])+block_length))
+            current_cache_flag = decoding_flag & ((decoding_start+block_length)<=current_cache_length)
+            while torch.any(current_cache_flag):
+                # Select sequences that can be processed in this mini-batch and build batch
+                decoding_seq_ids = select_decoding_batch_sequences(x, current_cache_flag, mask_id, mini_batch_size)
+                decoding_x = x.select_seqs(decoding_seq_ids)
+                decoding_block = gather_blocks(decoding_x.data, decoding_start[decoding_seq_ids], block_length)
+                decoding_past_key_values = self.past_key_values[:, :, decoding_seq_ids, :, :current_cache_length]
+                decoding_pos_ids = torch.arange(block_length, device=device, dtype=torch.long).repeat(decoding_seq_ids.shape[0], 1)
+                decoding_pos_ids = decoding_pos_ids + decoding_start[decoding_seq_ids].unsqueeze(1)
+                
+                # Forward pass
+                output = self.model(decoding_block, use_cache=True, position_ids=decoding_pos_ids, 
+                                 past_key_values=decoding_past_key_values)
+                # Decode logits and update token array
+                logits = output.logits[:len(decoding_seq_ids)]
+                self.decoder.batch_decode(logits, decoding_start[decoding_seq_ids], decoding_x, block_length)
+                block_finished = (decoding_block.data==mask_id).sum(dim=1)==0
+                # Update KV cache
+                inner_shape = output.past_key_values[0].shape
+                decoding_kv = torch.stack(output.past_key_values, dim=0).reshape(num_layers, 2, *inner_shape)[:, :, :block_finished.shape[0]]
+                block_idx_matrix = decoding_start[decoding_seq_ids[block_finished]].unsqueeze(1) + torch.arange(block_length, device=device)
+                self.past_key_values[:, :, decoding_seq_ids[block_finished].unsqueeze(1), :, block_idx_matrix.long()] = \
+                    decoding_kv.permute(2, 4, 0, 1, 3, 5)[block_finished, current_cache_length-block_length:current_cache_length]
+                # Update decoding start positions
+                decoding_start[decoding_seq_ids] += block_finished.long()*block_length
+                x[decoding_seq_ids] = decoding_x.data
+
+                # Check for EOS and early stop if enabled
+                eos_mask = (torch.any(x[decoding_seq_ids] == self.decoder.eos_id, dim=1) & block_finished)
+                eos_indices = eos_mask.nonzero(as_tuple=True)[0]
+                if self.early_stop and eos_indices.numel() > 0:
+                    stop_seq_ids = decoding_seq_ids[eos_indices]
+                    decoding_start[stop_seq_ids] = total_length 
+                    
+                    decoding_flag[stop_seq_ids] = False
+
+                # Update control flags
+                self.diff_iteration.num_forwards +=1
+                decoding_flag = decoding_flag & ((decoding_start+block_length)<=total_length)
+                current_cache_flag = decoding_flag & ((decoding_start+block_length)<=current_cache_length)
+                
         logger.info(f'The number of diffusion iterations: {self.num_forwards}')
         return x.get_generated_tokens()
 

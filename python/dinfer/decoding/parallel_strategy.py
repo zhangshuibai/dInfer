@@ -402,7 +402,7 @@ class ThresholdParallelDecoder(ParallelDecoder):
         self.use_float64 = use_float64
 
     def decode(self, logits, block_start, block_end, x, iter_threshold=None):
-        """ Decode the logits in a block.
+        """ Decode the logits in the same block of multiple samples.
         """
         if iter_threshold is None:
             iter_threshold = self.threshold
@@ -423,6 +423,38 @@ class ThresholdParallelDecoder(ParallelDecoder):
         assert transfer_index.dtype == torch.bool
         x[:, block_start:block_end] = torch.where(transfer_index, x0, curr_x)
         broadcast_if_needed(x.data)
+
+    def batch_decode(self, logits, block_start, x, block_length, iter_threshold=None):
+        """ Decode the logits in the different blocks of multiple samples, indicated by 1-d block_start tensor.
+        """
+        if iter_threshold is None:
+            iter_threshold = self.threshold
+        B, T = x.data.shape
+        device = x.data.device
+
+        offset = torch.arange(block_length, device=device).unsqueeze(0) + block_start.unsqueeze(1)  # [B, block_length]
+
+        x_block = torch.gather(x.data, 1, offset.clamp(max=T - 1)) 
+
+        mask_index = (x_block == self.mask_id)
+
+        x0, transfer_index = get_transfer_index_threshold(
+            logits,
+            self.temperature,
+            mask_index,
+            x_block,
+            self.mask_id,
+            threshold=iter_threshold,
+            use_float64=self.use_float64,
+        )
+
+        transfer_index = transfer_index & mask_index
+
+        x_updated = torch.where(transfer_index, x0, x_block)
+
+        x_flat = x.data.view(-1)
+        flat_idx = offset + torch.arange(B, device=device).unsqueeze(1) * T
+        x_flat[flat_idx] = x_updated
 
 
 class CreditThresholdParallelDecoder(ThresholdParallelDecoder):
