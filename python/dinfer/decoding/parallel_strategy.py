@@ -455,6 +455,7 @@ class ThresholdParallelDecoder(ParallelDecoder):
         x_flat = x.data.view(-1)
         flat_idx = offset + torch.arange(B, device=device).unsqueeze(1) * T
         x_flat[flat_idx] = x_updated
+        broadcast_if_needed(x.data)
 
 
 class CreditThresholdParallelDecoder(ThresholdParallelDecoder):

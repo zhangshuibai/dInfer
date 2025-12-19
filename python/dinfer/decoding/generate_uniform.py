@@ -969,7 +969,7 @@ def gather_blocks(x: torch.Tensor, idx: torch.Tensor, block_length: int) -> torc
 def select_batch_sequences_by_mask_number(x, valid_flag, mask_id, batch_size):
     # Select sequences to build a mini-batch, using sequences with most mask tokens
     cand_idx = torch.nonzero(valid_flag, as_tuple=False).squeeze(1)  # shape (N,)
-    _, sorted_order = torch.sort(-(x.data[cand_idx]==mask_id).sum(dim=1), stable=False)  
+    _, sorted_order = torch.sort(-(x.data[cand_idx]==mask_id).sum(dim=1), stable=True)  
     top_order = sorted_order[:batch_size] 
     return cand_idx[top_order]
 
