@@ -36,10 +36,207 @@ datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
 datasets.config.DOWNLOAD_TIMEOUT = 180 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
+bucket_size = 32
+used_buckets = []
+def warmup_cudagraph(rank, device, dllm, gen_len, block_length, batch_size, vocab_size):
+    if rank==0:
+        print('warmup')
+        print(used_buckets)
+        iterator = tqdm(used_buckets)
+    else:
+        iterator = used_buckets
+    offset = 0
+    for i in iterator:   
+        input_ids = torch.randint(0, vocab_size, (batch_size, i - gen_len+offset), dtype=torch.long, device=device)
+        dllm.generate(input_ids, gen_length=gen_len, block_length=block_length)
+
+def cut_eos(data, eos_id=156892):
+    eos_indices = (data[0] == eos_id).nonzero(as_tuple=True)[0]
+    if eos_indices.numel() > 0:
+        first_eos_idx = eos_indices[0].item()
+        return data[:, :first_eos_idx]
+    else:
+        return data
+
+
+@ torch.no_grad()
+def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
+    print('started', world_size, rank, gpu_id, args)
+    torch.cuda.set_device(gpu_id)
+    device = torch.device(gpu_id)
+
+    all_input_ids, padded_gen_lens = args.all_input_ids, args.padded_gen_lens
+
+    block_length=args.block_length
+    # print()
+    from vllm import distributed
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = str(args.master_port+args.port_offset)
+    distributed.init_distributed_environment(world_size, rank, 'env://', rank, 'nccl')
+    distributed.initialize_model_parallel(args.tp_size, backend='nccl')
+    print("[Loading model]")
+    # setup EP
+    parallel_config = ParallelConfig(enable_expert_parallel = True)
+    with set_current_vllm_config(VllmConfig(parallel_config = parallel_config)):
+        vllm_config = get_current_vllm_config()
+        print("EP Enabled:", vllm_config.parallel_config.enable_expert_parallel)
+
+        model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+        if 'llada_moe' == args.model_type:
+            model = LLaDAMoeModelLM(config=model_config).eval()
+            model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
+            print('llada_moe')
+        elif 'llada2' == args.model_type:
+            model = LLaDA2MoeModelLM(config=model_config).eval()
+            model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
+        elif 'llada' == args.model_type:
+            model = LLaDAModelLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16, init_device=device).eval()
+        else:
+            raise ValueError('model type not supported')
+
+        if args.tp_size>1 and args.use_tp:
+            print('enabling tp')
+            model.tensor_parallel(args.tp_size)
+
+        x = torch.arange(50+args.gen_len, dtype=torch.long, device=device).unsqueeze(0)
+        model = model.to(device)
+        out = model(x, use_cache=False)
+        out = model(x, use_cache=True)
+
+        if args.use_compile:
+            if args.use_cudagraph:
+                model.forward = torch.compile(model.forward, mode='reduce-overhead', fullgraph=False, dynamic=True)
+            else:
+                model.forward = torch.compile(model.forward, fullgraph=False, dynamic=True)
+
+
+        if args.parallel_decoding == 'threshold':
+            if args.use_credit:
+                decoder = CreditThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=args.mask_id, eos_id=args.eos_id)
+            else:
+                decoder = ThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=args.mask_id, eos_id=args.eos_id)
+
+        else:
+            decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=args.mask_id, eos_id=args.eos_id)
+
+        use_sw = args.prefix_look > 0 or args.after_look > 0 or args.warmup_times > 0
+
+        if args.cache == 'prefix' or args.cache == 'dual':
+            cache_factory=KVCacheFactory(args.cache, is_bd_model=args.use_bd)
+        else:
+            cache_factory=None
+
+        if not args.use_bd:
+            if args.cont_weight>0:
+                if use_sw:
+                    print("IterSmoothWithVicinityCacheDiffusionLLM")
+                    dllm = IterSmoothWithVicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,
+                        cont_weight=args.cont_weight, prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
+                else:
+                    print("IterSmoothDiffusionLLM")
+                    dllm = IterSmoothDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, cont_weight=args.cont_weight)
+            else:
+                if use_sw:
+                    print("VicinityCacheDiffusionLLM")
+                    dllm = VicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
+                else:
+                    print("BlockWiseDiffusionLLM")
+                    dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
+        else:
+            print("BlockDiffusionLLM")
+            dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True)
+
+        warmup_cudagraph(rank, device, dllm, args.gen_len, block_length, args.batch_size, args.vocab_size)
+                
+        for wi in range(1):
+            outputs = []
+            total_forward = 0
+            if rank==0:
+                iterator = trange(0, len(all_input_ids), args.batch_size)
+            else:
+                iterator = range(0, len(all_input_ids), args.batch_size)
+            start = time.time()
+            tpfs = []
+            tpss = []
+            fpss = []
+            total_token = 0
+            token_numbers = []
+            for i in iterator:   
+                input_ids = all_input_ids[i:i+args.batch_size]
+                max_length = 0
+                min_padded_length = 10000
+                for j, seq in enumerate(input_ids):
+                    if seq.shape[1] > max_length:
+                        max_length = seq.shape[1]
+                        min_padded_length = padded_gen_lens[i+j]
+                batch_input_ids= torch.zeros((len(input_ids), max_length), dtype=torch.long, device=device).fill_(args.mask_id)
+                for j in range(len(input_ids)):
+                    batch_input_ids[j, :input_ids[j].shape[1]] = input_ids[j].to(device)
+                input_ids = batch_input_ids
+                padded_gen_len = padded_gen_lens[i]
+                inner_start = time.time()
+                prev_forwards = dllm.num_forwards
+                out = dllm.generate(input_ids, gen_length=min_padded_length, block_length=block_length)
+                nfe = dllm.num_forwards - prev_forwards
+                inner_stop = time.time()
+                sample_time = inner_stop - inner_start
+                for j in range(input_ids.shape[0]):
+                    outputs.append(out[j].unsqueeze(0))
+                total_forward += nfe
+                batch_token_number = 0
+                for j in range(input_ids.shape[0]):
+                    token_number = int((out[j]!=156892).sum() - all_input_ids[i+j].shape[1])
+                    batch_token_number += token_number
+                    token_numbers.append(token_number)
+                tpf = batch_token_number/nfe/args.batch_size
+                tps = batch_token_number/sample_time
+                fps = nfe/sample_time
+                if rank == 0:
+                    print(f'[iter {i:4d}]nfe={nfe:4d}, token number={batch_token_number:4d}, fps={fps:4.2f},tpf={tpf:2.2f}, tps={tps:4.2f}')
+                    if wi==0 and i<5:
+                        for j in range(input_ids.shape[0]):
+                            answer = cut_eos(out[j, all_input_ids[i+j].shape[1]:].unsqueeze(0))[0]
+                            # print(answer)
+                            print(f'generated text {j}: {tokenizer.decode(answer, skip_special_tokens=False)}')
+                tpfs.append(tpf)
+                tpss.append(tps)
+                fpss.append(fps)
+                total_token += token_number
+
+        total_token = total_token
+
+        stop = time.time()
+        answers = []
+        if rank==0:
+            for i in trange(len(outputs)):
+                out = outputs[i]
+                answer = (tokenizer.decode(out[0, all_input_ids[i].shape[1]:], skip_special_tokens=True))
+                answers.append(answer)
+            print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/(stop-start)}({np.mean(fpss)}), TPS: {total_token/(stop-start)}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
+            filename = args.save_path
+            with open (filename, 'w') as f:
+                for i in range(len(answers)):
+                    answer = answers[i]
+                    json.dump({'answer': answer, 'generated_length': token_numbers[i], 'tpf':tpfs[i//args.batch_size], 'tps':tpss[i//args.batch_size], 'fps':fpss[i//args.batch_size], }, f)
+                    f.write('\n')
+            print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/(stop-start)}({np.mean(fpss)}), TPS: {total_token/(stop-start)}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
+
+            if args.save_dir is not None:
+                with open (args.save_dir+f'/results.jsonl', 'w', encoding='utf-8') as file:
+                    data={'rank':f'rank{rank}',
+                        'forward per second': f"{total_forward/(stop-start)}({np.mean(fpss)})",
+                        'tokens per second': f"{total_token/(stop-start)}({np.mean(tpss)})",
+                        'tokens per forward':  f"{total_token/total_forward}({np.mean(tpfs)})",
+                        'average generated length': total_token / len(all_input_ids)
+                        }
+                    file.write(json.dumps(data, ensure_ascii=False) + '\n')
+        return 
+        
+
 @dataclass
 class EvalConfig:
     model_name: str = ''
-    gpu: str = '0;1;2;3'
+    gpu: str = '0,1,2,3'
     batch_size: int = 1
     gen_len: int = 1024
     prefix_look: int = 0
@@ -66,6 +263,11 @@ class EvalConfig:
     model_type: str = 'llada'
     vocab_size: int = 156896
     master_port: int = 23456
+    mask_id: int = 156895
+    eos_id: int = 156892
+    save_dir: str = './res'
+    save_samples: bool = False
+
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -103,12 +305,13 @@ class DInferEvalHarness(LM):
         use_compile = True,
         master_port = 23456,
         use_cudagraph = True,
-        gpus = '0;1;2;3',
+        gpus = '0,1,2,3',
         use_bd = False,
         prefix_look = 0,
         after_look = 0,
         use_shift = False,
         model_type = 'llada',
+        save_samples = False,
         **kwargs
     ):
 
@@ -146,6 +349,7 @@ class DInferEvalHarness(LM):
         self.kwargs = kwargs
         self.use_shift = use_shift
         self.model_type = model_type
+        self.save_samples = save_samples
 
         if self.model_type == 'llada_moe':
             self.mask_id = 156895
@@ -407,8 +611,7 @@ class DInferEvalHarness(LM):
             os.makedirs(self.save_dir, exist_ok=True)
             self.save_path = os.path.join(self.save_dir, f'rank_{self.rank}.jsonl')
             print(f"save_path: {self.save_path}")
-        bucket_size = 32
-        used_buckets = []
+        
 
         def get_bucket_length(length):
             bucket_length = bucket_size*(length//bucket_size)
@@ -436,197 +639,7 @@ class DInferEvalHarness(LM):
                 padded_gen_lens.append(padded_length - input_ids.shape[1])
             return padded_gen_lens
 
-        def warmup_cudagraph(rank, device, dllm, gen_len, block_length, batch_size, vocab_size):
-            if rank==0:
-                print('warmup')
-                print(used_buckets)
-                iterator = tqdm(used_buckets)
-            else:
-                iterator = used_buckets
-            offset = 0
-            for i in iterator:   
-                input_ids = torch.randint(0, vocab_size, (batch_size, i - gen_len+offset), dtype=torch.long, device=device)
-                dllm.generate(input_ids, gen_length=gen_len, block_length=block_length)
-        
-        def cut_eos(data, eos_id=156892):
-            eos_indices = (data[0] == eos_id).nonzero(as_tuple=True)[0]
-            if eos_indices.numel() > 0:
-                first_eos_idx = eos_indices[0].item()
-                return data[:, :first_eos_idx]
-            else:
-                return data
 
-        @ torch.no_grad()
-        def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
-            print('started', world_size, rank, gpu_id)
-            torch.cuda.set_device(gpu_id)
-            device = torch.device(gpu_id)
-
-            all_input_ids, padded_gen_lens = args.all_input_ids, args.padded_gen_lens
-
-            block_length=self.block_length
-
-            from vllm import distributed
-            os.environ['MASTER_ADDR'] = 'localhost'
-            os.environ['MASTER_PORT'] = str(args.master_port+args.port_offset)
-            distributed.init_distributed_environment(world_size, rank, 'env://', rank, 'nccl')
-            distributed.initialize_model_parallel(args.tp_size, backend='nccl')
-            print("[Loading model]")
-            # setup EP
-            parallel_config = ParallelConfig(enable_expert_parallel = True)
-            with set_current_vllm_config(VllmConfig(parallel_config = parallel_config)):
-                vllm_config = get_current_vllm_config()
-                print("EP Enabled:", vllm_config.parallel_config.enable_expert_parallel)
-
-                model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
-                if 'llada_moe' == args.model_type:
-                    model = LLaDAMoeModelLM(config=model_config).eval()
-                    model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
-                elif 'llada2' == args.model_type:
-                    model = LLaDA2MoeModelLM(config=model_config).eval()
-                    model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
-                elif 'llada' == args.model_type:
-                    model = LLaDAModelLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16, init_device=device).eval()
-                else:
-                    raise ValueError('model type not supported')
-
-                if args.tp_size>1 and args.use_tp:
-                    print('enabling tp')
-                    model.tensor_parallel(args.tp_size)
-
-                x = torch.arange(50+args.gen_len, dtype=torch.long, device=device).unsqueeze(0)
-                model = model.to(device)
-                out = model(x, use_cache=False)
-                out = model(x, use_cache=True)
-
-                if args.use_compile:
-                    if args.use_cudagraph:
-                        model.forward = torch.compile(model.forward, mode='reduce-overhead', fullgraph=False, dynamic=True)
-                    else:
-                        model.forward = torch.compile(model.forward, fullgraph=False, dynamic=True)
-
-
-                if args.parallel_decoding == 'threshold':
-                    if args.use_credit:
-                        decoder = CreditThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=self.mask_id, eos_id=self.eos_id)
-                    else:
-                        decoder = ThresholdParallelDecoder(temperature=0, threshold=args.threshold, mask_id=self.mask_id, eos_id=self.eos_id)
-
-                else:
-                    decoder = HierarchyDecoder(temperature=0, threshold=args.threshold, low_threshold=args.low_threshold, mask_id=self.mask_id, eos_id=self.eos_id)
-
-                use_sw = args.prefix_look > 0 or args.after_look > 0 or args.warmup_times > 0
-
-                if args.cache == 'prefix' or args.cache == 'dual':
-                    cache_factory=KVCacheFactory(args.cache, is_bd_model=args.use_bd)
-                else:
-                    cache_factory=None
-
-                if not args.use_bd:
-                    if args.cont_weight>0:
-                        if use_sw:
-                            print("IterSmoothWithVicinityCacheDiffusionLLM")
-                            dllm = IterSmoothWithVicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,
-                                cont_weight=args.cont_weight, prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
-                        else:
-                            print("IterSmoothDiffusionLLM")
-                            dllm = IterSmoothDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, cont_weight=args.cont_weight)
-                    else:
-                        if use_sw:
-                            print("VicinityCacheDiffusionLLM")
-                            dllm = VicinityCacheDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True,prefix_look=args.prefix_look, after_look=args.after_look, warmup_steps=args.warmup_times)
-                        else:
-                            print("BlockWiseDiffusionLLM")
-                            dllm = BlockWiseDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True, use_shift=args.use_shift)
-                else:
-                    print("BlockDiffusionLLM")
-                    dllm = BlockDiffusionLLM(model, decoder, BlockIteratorFactory(start_block_align=True), cache_factory=cache_factory, early_stop=True)
-
-                warmup_cudagraph(rank, device, dllm, args.gen_len, block_length, args.batch_size, args.vocab_size)
-                        
-                for wi in range(1):
-                    outputs = []
-                    total_forward = 0
-                    if rank==0:
-                        iterator = trange(0, len(all_input_ids), args.batch_size)
-                    else:
-                        iterator = range(0, len(all_input_ids), args.batch_size)
-                    start = time.time()
-                    tpfs = []
-                    tpss = []
-                    fpss = []
-                    total_token = 0
-                    token_numbers = []
-                    for i in iterator:   
-                        input_ids = all_input_ids[i:i+args.batch_size]
-                        max_length = 0
-                        min_padded_length = 10000
-                        for j, seq in enumerate(input_ids):
-                            if seq.shape[1] > max_length:
-                                max_length = seq.shape[1]
-                                min_padded_length = padded_gen_lens[i+j]
-                        batch_input_ids= torch.zeros((len(input_ids), max_length), dtype=torch.long, device=device).fill_(self.mask_id)
-                        for j in range(len(input_ids)):
-                            batch_input_ids[j, :input_ids[j].shape[1]] = input_ids[j].to(device)
-                        input_ids = batch_input_ids
-                        padded_gen_len = padded_gen_lens[i]
-                        inner_start = time.time()
-                        prev_forwards = dllm.num_forwards
-                        out = dllm.generate(input_ids, gen_length=min_padded_length, block_length=block_length)
-                        nfe = dllm.num_forwards - prev_forwards
-                        inner_stop = time.time()
-                        sample_time = inner_stop - inner_start
-                        for j in range(input_ids.shape[0]):
-                            outputs.append(out[j].unsqueeze(0))
-                        total_forward += nfe
-                        batch_token_number = 0
-                        for j in range(input_ids.shape[0]):
-                            token_number = int((out[j]!=156892).sum() - all_input_ids[i+j].shape[1])
-                            batch_token_number += token_number
-                            token_numbers.append(token_number)
-                        tpf = batch_token_number/nfe/args.batch_size
-                        tps = batch_token_number/sample_time
-                        fps = nfe/sample_time
-                        if rank == 0:
-                            print(f'[iter {i:4d}]nfe={nfe:4d}, token number={batch_token_number:4d}, fps={fps:4.2f},tpf={tpf:2.2f}, tps={tps:4.2f}')
-                            if wi==0 and i<5:
-                                for j in range(input_ids.shape[0]):
-                                    answer = cut_eos(out[j, all_input_ids[i+j].shape[1]:].unsqueeze(0))[0]
-                                    # print(answer)
-                                    print(f'generated text {j}: {tokenizer.decode(answer, skip_special_tokens=False)}')
-                        tpfs.append(tpf)
-                        tpss.append(tps)
-                        fpss.append(fps)
-                        total_token += token_number
-
-                total_token = total_token
-
-                stop = time.time()
-
-                if rank==0:
-                    for i in trange(len(outputs)):
-                        out = outputs[i]
-                        answer = (tokenizer.decode(out[0, all_input_ids[i].shape[1]:], skip_special_tokens=True))
-                        answers.append(answer)
-                    print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/(stop-start)}({np.mean(fpss)}), TPS: {total_token/(stop-start)}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
-                    filename = args.save_path
-                    with open (filename, 'w') as f:
-                        for i in range(len(answers)):
-                            answer = answers[i]
-                            json.dump({'answer': answer, 'generated_length': token_numbers[i], 'tpf':tpfs[i//args.batch_size], 'tps':tpss[i//args.batch_size], 'fps':fpss[i//args.batch_size], }, f)
-                            f.write('\n')
-                    print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/(stop-start)}({np.mean(fpss)}), TPS: {total_token/(stop-start)}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
-
-                    if self.show_speed and self.save_dir is not None:
-                        with open (self.save_dir+f'/results.jsonl', 'w', encoding='utf-8') as file:
-                            data={'rank':f'rank{self.rank}',
-                                'forward per second': f"{total_forward/(stop-start)}({np.mean(fpss)})",
-                                'tokens per second': f"{total_token/(stop-start)}({np.mean(tpss)})",
-                                'tokens per forward':  f"{total_token/total_forward}({np.mean(tpfs)})",
-                                'average generated length': total_token / len(all_input_ids)
-                                }
-                            file.write(json.dumps(data, ensure_ascii=False) + '\n')
-                return 
         all_input_ids = load_inputs(requests, self.tokenizer)
         padded_gen_lens = cal_bucket_len(self.gen_length, all_input_ids)
         
@@ -687,7 +700,7 @@ class DInferEvalHarness(LM):
             procs = []
             answers = []
             gpus = [int(gpu) for gpu in self.gpus.split(';')]
-            args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size}
+            args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "mask_id": self.mask_id, "eos_id": self.eos_id, "save_dir": self.save_dir, "save_samples": self.save_samples}
             args = EvalConfig(**args)
             args.tp_size = len(gpus)
             args.master_port = self.master_port
@@ -710,12 +723,13 @@ class DInferEvalHarness(LM):
             with open(self.save_path, 'r') as f:
                 for line in f :
                     answers.append(json.loads(line)["answer"])
-            if self.save_dir is None:
+            if not self.save_samples:
                 os.remove(self.save_path)
         return answers
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     set_seed(1234)
     cli_evaluate()
     

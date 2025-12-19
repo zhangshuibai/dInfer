@@ -270,6 +270,7 @@ class EvalConfig:
     vocab_size: int = 156896
     master_port: int = 23456
     batch_size: int = 1
+    save_samples: bool = False
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -313,6 +314,7 @@ class DInferEvalHarness(LM):
         after_look = 0,
         use_shift = False,
         model_type = 'llada2',
+        save_samples = False,
         **kwargs
     ):
 
@@ -350,6 +352,7 @@ class DInferEvalHarness(LM):
         self.kwargs = kwargs
         self.use_shift = use_shift
         self.model_type = model_type
+        self.save_samples = save_samples
 
         if self.model_type == 'llada2': 
             self.mask_id = 156895
@@ -563,93 +566,37 @@ class DInferEvalHarness(LM):
                 padded_gen_lens.append(padded_length - input_ids.shape[1])
             return padded_gen_lens
 
-
-
         all_input_ids = load_inputs(requests, self.tokenizer)
         padded_gen_lens = cal_bucket_len(self.gen_length, all_input_ids)
-        
-        answers = []
-        outputs = []
-        total_forward = 0
-        start = time.time()
-        tpfs = []
-        tpss = []
-        fpss = []
-        total_token = 0
-        token_numbers = []
     
-        if self.parallel == 'dp':
-            with set_current_vllm_config(self.vllm_config):
-                    if self.use_cudagraph and self.use_cudagraph:
-                        warmup_cudagraph(self.rank, self.device, self.dllm, self.gen_length, self.block_length, self.batch_size, self.vocab_size)
-                    for i, req in enumerate(tqdm(requests, desc="Generating...")):
-                        input_ids = all_input_ids[i]
-                        padded_gen_len = padded_gen_lens[i]
-                        inner_start = time.time()
-                        input_ids = input_ids.to(self.device)
-                        prev_forwards = self.dllm.num_forwards
-                        out = self.dllm.generate(input_ids, gen_length=padded_gen_len,block_length=self.block_length)
-                        nfe = self.dllm.num_forwards - prev_forwards
-                        inner_stop = time.time()
-                        sample_time = inner_stop - inner_start
-                        outputs.append(out)
-                        answer = (self.tokenizer.decode(out[0, all_input_ids[i].shape[1]:], skip_special_tokens=True))
-                        answers.append(answer)
-                        total_forward += nfe
-                        token_number = out.shape[1] - input_ids.shape[1]
-                        token_numbers.append(token_number)
-                        tpf = token_number/nfe
-                        tps = token_number/sample_time
-                        fps = nfe/sample_time
-                        if self.rank == 0:
-                            print(f'iter={i}, fps={fps}, nfe={nfe}')
-                        tpfs.append(tpf)
-                        tpss.append(tps)
-                        fpss.append(fps)
-                        total_token += token_number
-            total_token = total_token
-
-            stop = time.time()
-            print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/(stop-start)}({np.mean(fpss)}), TPS: {total_token/(stop-start)}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
-
-            if self.show_speed and self.save_dir is not None:
-                with open (self.save_dir+f'/rank{self.rank}_results.jsonl', 'w', encoding='utf-8') as file:
-                    data={'rank':f'rank{self.rank}',
-                        'forward per second': np.mean(fpss),
-                        'tokens per second': np.mean(tpss),
-                        'tokens per forward': np.mean(tpfs),
-                        'average generated length': total_token / len(all_input_ids)
-                        }
-                    file.write(json.dumps(data, ensure_ascii=False) + '\n')
-        elif self.parallel == 'tp':
-            procs = []
-            answers = []
-            gpus = [int(gpu) for gpu in self.gpus.split(';')]
-            args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size}
-            args = EvalConfig(**args)
-            args.tp_size = len(gpus)
-            args.master_port = self.master_port
-            args.use_tp = args.tp_size > 1
-            args.port_offset = gpus[0]
-            args.all_input_ids = all_input_ids
-            args.padded_gen_lens = padded_gen_lens
-            
-            if len(gpus) == 1:
-                run_benchmark(1, 0, gpus[0], self.tokenizer, args)
-            else:
-                for i, gpu in enumerate(gpus):
-                    p = Process(target=run_benchmark, args=(len(gpus), i, gpu, self.tokenizer, args))
-                    # p.daemon = True
-                    procs.append(p)
-                    p.start()
-                for p in procs:
-                    p.join()
-            answers = []
-            with open(self.save_path, 'r') as f:
-                for line in f :
-                    answers.append(json.loads(line)["answer"])
-            if self.save_dir is None:
-                os.remove(self.save_path)
+        procs = []
+        answers = []
+        gpus = [int(gpu) for gpu in self.gpus.split(';')]
+        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size}
+        args = EvalConfig(**args)
+        args.tp_size = len(gpus)
+        args.master_port = self.master_port
+        args.use_tp = args.tp_size > 1
+        args.port_offset = gpus[0]
+        args.all_input_ids = all_input_ids
+        args.padded_gen_lens = padded_gen_lens
+        
+        if len(gpus) == 1:
+            run_benchmark(1, 0, gpus[0], self.tokenizer, args)
+        else:
+            for i, gpu in enumerate(gpus):
+                p = Process(target=run_benchmark, args=(len(gpus), i, gpu, self.tokenizer, args))
+                # p.daemon = True
+                procs.append(p)
+                p.start()
+            for p in procs:
+                p.join()
+        answers = []
+        with open(self.save_path, 'r') as f:
+            for line in f :
+                answers.append(json.loads(line)["answer"])
+        if not self.save_samples is None:
+            os.remove(self.save_path)
         return answers
 
 
