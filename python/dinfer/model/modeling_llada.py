@@ -623,10 +623,6 @@ class RotaryEmbedding(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
     def apply_rotary_pos_emb(self, pos_sin: torch.Tensor, pos_cos: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        if pos_cos.shape[-1] != t.shape[-1]:
-            head_dim_per_partition = t.shape[-1]
-            pos_sin = pos_sin[..., :head_dim_per_partition]
-            pos_cos = pos_cos[..., :head_dim_per_partition]
         return ((t * pos_cos) + (self.rotate_half(t) * pos_sin)).to(t.dtype)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, block_end_index: Optional[torch.Tensor] = None, start_pos: int=0) -> Tuple[torch.Tensor, torch.Tensor]:
