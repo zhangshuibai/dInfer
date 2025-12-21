@@ -76,7 +76,9 @@ To use it with SGLang backend (it works with LLaDA2), please install SGLang.
 pip install sglang==0.5.3.post1
 ```
 
-### Convert to FusedMoE (MoE models only)
+### Convert to FusedMoE (LLaDA-MoE only)
+
+To run LLaDA-MoE model downloaded from HuggingFace, we need to first convert it to a format supported by dInfer. dInfer provides a script `tools/transfer.py` for the format conversion.
 
 #### 1) Download and Convert
 
@@ -212,7 +214,7 @@ dInfer delivers over 1,100 TPS at batch size 1 on HumanEval and on average 800+ 
 
 ### The inference speed (TPS) on LLaDA2-flash-CAP
 
-The inference speed is measured on LLaDA2-flash-CAP (with 100B parameters) on 8 H20 GPUs (parallel decoding threshold=0.95).
+The inference speed is measured on LLaDA2-flash-CAP (with 100B parameters) on 8 H20 GPUs (parallel decoding threshold=0.95, generation length=1000).
 
 | Benchmark        | batch size = 1 | batch size = 32 |
 |------------------|----------------|-----------------|
