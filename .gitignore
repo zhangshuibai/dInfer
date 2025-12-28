@@ -1,4 +1,5 @@
 evaluations/outputs/
+evaluations/outputs_exp/
 build/
 python/dinfer.egg-info
 

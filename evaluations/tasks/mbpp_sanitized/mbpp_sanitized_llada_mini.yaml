@@ -18,7 +18,7 @@ generation_kwargs:
   until:
     - "\n```\n"
   max_gen_toks: 8192
-  temperature: 0.0
+  temperature: 0.8
   do_sample: false
 metadata:
   version: 1.0
