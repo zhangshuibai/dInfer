@@ -10,8 +10,8 @@ export TRANSFORMERS_TRUST_REMOTE_CODE=1
 export CUDA_VISIBLE_DEVICES=2,4
 
 parallel_decoding='threshold' # or hierarchy
-length=2048 # generate length
-block_length=8 # block length
+length=4096 # generate length
+block_length=32 # block length
 model_path='/root/inclusion_data/separate_expert_model/LLaDA2.0-mini-preview' # your model path  
 threshold=0.98 # threshold for parallel decoding
 low_threshold=0.62 # low threshold for parallel decoding when using hierarchy mechanism
@@ -22,7 +22,7 @@ after_look=0
 cont_weight=0 # cont weight
 use_credit=False # enable credit for threshold mechanism
 use_compile=True # use compile
-tp_size=4 # tensor parallel size
+tp_size=2 # tensor parallel size
 gpus='0;1' # gpus for tensor parallel inference
 parallel='tp' # 'tp' for tensor parallel or 'dp' for data parallel
 output_dir='./outputs_exp' # your customer output path
@@ -30,13 +30,13 @@ model_type='llada2' # llada2 (for llada2-mini)
 use_bd=True # use block diffusion
 master_port="23591"
 save_samples=False # save samples
-enable_remask_values=(False True) # enable remasking for threshold decoder
+enable_remask_values=(False) # enable remasking for threshold decoder
 # for llada 1.5 use tasks gsm8k_llada1.5 mbpp_sanitized_llada1.5
 # for llada2_mini use tasks gsm8k_llada_mini mbpp_sanitized_llada_mini
 #tasks: minerva_math_algebra_llada_mini, gsm8k_llada_mini, mbpp_sanitized_llada_mini,minerva_math500
 if [ parallel=='tp' ]; then
   for enable_remask in "${enable_remask_values[@]}"; do
-    for task in minerva_math_algebra_llada_mini; do
+    for task in aime25; do
       output_path=${output_dir}/${task}_remask_${enable_remask}
       python eval_dinfer_sglang.py --tasks ${task} \
       --confirm_run_unsafe_code --model dInfer_eval \
