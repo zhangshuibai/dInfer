@@ -602,7 +602,7 @@ class DInferEvalHarness(LM):
         with open(self.save_path, 'r') as f:
             for line in f :
                 answers.append(json.loads(line)["answer"])
-        if not self.save_samples is None:
+        if self.save_samples is False:
             os.remove(self.save_path)
         return answers
 
