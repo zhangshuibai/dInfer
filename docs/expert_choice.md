@@ -4,6 +4,8 @@ Goal: add expert-choice routing (experts pick tokens) to
 `python/dinfer/model/modeling_llada2_moe_sglang.py`, which currently uses
 token-choice (tokens pick experts).
 
+Note: please create a new branch for this work; do not modify `master`.
+
 ## Current token-choice path
 - Routing happens in `LLaDA2SparseMoeBlock._forward_router_experts()`:
   - `router_logits = gate(hidden_states)` gives `[N, E]`.
