@@ -17,6 +17,7 @@ import json
 import time
 import datasets
 import os
+import pathlib
 from transformers import AutoTokenizer, AutoConfig
 import torch.multiprocessing as mp
 from multiprocessing import Process
@@ -609,4 +610,15 @@ class DInferEvalHarness(LM):
 
 if __name__ == "__main__":
     set_seed(1234)
-    cli_evaluate()
+    # Avoid lm_eval crashing when tasks are loaded from an external include_path.
+    _orig_relative_to = pathlib.Path.relative_to
+    def _safe_relative_to(self, *args, **kwargs):
+        try:
+            return _orig_relative_to(self, *args, **kwargs)
+        except ValueError:
+            return self
+    pathlib.Path.relative_to = _safe_relative_to
+    try:
+        cli_evaluate()
+    finally:
+        pathlib.Path.relative_to = _orig_relative_to

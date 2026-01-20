@@ -62,7 +62,7 @@ dInfer supports multiple diffusion language model variants with different archit
 ```
 git clone https://github.com/inclusionAI/dInfer.git
 cd dInfer
-pip install .
+pip install -e .
 ```
 
 To use it with vLLM backend (it works with LLaDA and LLaDA-MoE), please install vLLM.
