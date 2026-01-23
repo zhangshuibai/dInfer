@@ -327,7 +327,7 @@ class CudaGraphRunner:
                 empty_cache=False,
             )
             # Reverse the order to enable better memory sharing across cuda graphs.
-            logger.info('capture batch sizes', self.capture_bs)
+            logger.info('capture batch sizes: %s', self.capture_bs)
             for bs in reversed(self.capture_bs):
                 capture_cache_length_range = (
                     tqdm.tqdm(list(reversed(self.cache_lengths)))
@@ -486,7 +486,8 @@ class CudaGraphRunner:
         if not self.disable_padding and is_decode_phase:
             is_bs_supported = is_bs_supported or (self.max_bs, is_decode_phase, length, cache_length) in self.graphs.keys()
         if is_bs_supported == False:
-            logger.debug('not supported', cuda_graph_bs, is_decode_phase, length, cache_length, self.graphs.keys())
+            logger.debug('not supported: bs=%s, is_decode=%s, length=%s, cache_length=%s, graphs=%s', 
+                        cuda_graph_bs, is_decode_phase, length, cache_length, self.graphs.keys())
         return is_bs_supported
 
 

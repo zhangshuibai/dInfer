@@ -256,51 +256,64 @@ def _wrap_metric(metric_func, metric_name):
         if not isinstance(references, (list, tuple)):
             references = [references]
         
+        # Ensure we have matching lengths
+        min_len = min(len(predictions), len(references))
+        predictions = predictions[:min_len]
+        references = references[:min_len]
+        
         scores = []
         for i, (pred, ref) in enumerate(zip(predictions, references)):
             # Clean prediction - remove "Output: " prefix if present
             if isinstance(pred, str) and pred.startswith("Output:"):
                 pred = pred.replace("Output:", "").strip()
             
+            # Handle reference format - try to convert to dict
+            if isinstance(ref, str):
+                try:
+                    import json
+                    ref = json.loads(ref)
+                except Exception:
+                    pass
+            if isinstance(ref, list) and len(ref) == 1:
+                ref = ref[0]
+            
+            # If ref is not a dict, set score to 0.0
+            if not isinstance(ref, dict):
+                scores.append(0.0)
+                continue
+            
+            # Call metric function
             try:
-                # Call metric function
-                if isinstance(ref, dict):
-                    score = metric_func(pred, ref, strict=False)
-                else:
-                    score = metric_func(pred, ref, strict=False)
+                score = metric_func(pred, ref, strict=False)
             except Exception as e:
-                # If metric function fails, return 0.0
-                print(f"Warning: Metric {metric_name} failed for prediction {i}: {e}")
                 score = 0.0
             
             # Handle dict return values
             if isinstance(score, dict):
                 score = score.get("score", 0.0)
             
-            # Recursively unwrap nested structures
-            max_depth = 10
-            depth = 0
-            while isinstance(score, (list, tuple)) and depth < max_depth:
+            # Handle list/tuple return values - recursively flatten and take average if numeric
+            if isinstance(score, (list, tuple)):
                 if len(score) == 0:
                     score = 0.0
-                    break
-                # If all elements are numeric, average them
-                try:
-                    numeric_scores = [float(x) for x in score if isinstance(x, (int, float, str))]
+                else:
+                    # Recursively flatten nested lists
+                    def flatten_nested_list(lst):
+                        result = []
+                        for item in lst:
+                            if isinstance(item, (list, tuple)):
+                                result.extend(flatten_nested_list(item))
+                            elif isinstance(item, (int, float)):
+                                result.append(float(item))
+                        return result
+                    
+                    numeric_scores = flatten_nested_list(score)
                     if numeric_scores:
                         score = sum(numeric_scores) / len(numeric_scores)
-                        break
-                except (ValueError, TypeError):
-                    pass
-                # Otherwise take first element and continue unwrapping
-                score = score[0]
-                depth += 1
+                    else:
+                        score = 0.0
             
-            # If still a list/tuple, force to 0.0
-            if isinstance(score, (list, tuple)):
-                score = 0.0
-            
-            # Convert to float - handle all possible types
+            # Convert to float
             try:
                 if score is None:
                     score = 0.0
@@ -308,40 +321,41 @@ def _wrap_metric(metric_func, metric_name):
                     score = 1.0 if score else 0.0
                 else:
                     score = float(score)
-            except (ValueError, TypeError) as e:
-                print(f"Warning: Could not convert score to float at index {i}: {score} (type: {type(score)}), error: {e}")
+            except (ValueError, TypeError):
                 score = 0.0
             
-            # Final check - must be a number
-            if not isinstance(score, (int, float)):
-                print(f"Error: Score at index {i} is not numeric after conversion: {score} (type: {type(score)}), setting to 0.0")
-                score = 0.0
-            
-            # Ensure it's a float before appending
-            final_score = float(score)
-            scores.append(final_score)
+            scores.append(score)
         
-        # Final validation pass - ensure every element is a float and flatten any nested structures
+        # Return list of scores - ensure all are floats and no nested structures
         result = []
-        for i, s in enumerate(scores):
-            # If somehow we still have a list/tuple, handle it
+        for s in scores:
             if isinstance(s, (list, tuple)):
-                print(f"Error: Found list/tuple in scores at index {i}: {s}, using 0.0")
+                # This shouldn't happen, but handle it defensively
+                print(f"WARNING in {metric_name}: Found list in scores: {s}, converting to 0.0")
                 result.append(0.0)
-            elif isinstance(s, (int, float)):
-                result.append(float(s))
             else:
-                print(f"Error: Found non-numeric value in scores at index {i}: {s} (type: {type(s)}), using 0.0")
-                result.append(0.0)
+                try:
+                    result.append(float(s))
+                except (ValueError, TypeError):
+                    print(f"WARNING in {metric_name}: Could not convert score to float: {s} (type: {type(s)}), using 0.0")
+                    result.append(0.0)
         
-        # Double check - ensure no nested structures remain
+        # Final validation - ensure result is a flat list of floats
         final_result = []
         for i, val in enumerate(result):
             if isinstance(val, (list, tuple)):
-                print(f"Critical Error: Still found list/tuple at index {i}: {val}")
+                print(f"ERROR in {metric_name}: Found nested structure at index {i}: {val}")
+                final_result.append(0.0)
+            elif not isinstance(val, (int, float)):
+                print(f"ERROR in {metric_name}: Found non-numeric value at index {i}: {val} (type: {type(val)})")
                 final_result.append(0.0)
             else:
                 final_result.append(float(val))
+        
+        # Debug output
+        if len(final_result) > 0:
+            types_str = ', '.join([type(x).__name__ for x in final_result[:5]])
+            print(f"DEBUG {metric_name}: Returning {len(final_result)} scores: {final_result[:5]}... (types: {types_str})")
         
         return final_result
     

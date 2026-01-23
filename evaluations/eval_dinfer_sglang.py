@@ -578,7 +578,13 @@ class DInferEvalHarness(LM):
     
         procs = []
         answers = []
-        gpus = [int(gpu) for gpu in self.gpus.split(';')]
+        # Handle gpus parameter - can be string like '0;1;2;3' or integer like 0
+        if isinstance(self.gpus, (int, float)):
+            gpus = [int(self.gpus)]
+        elif isinstance(self.gpus, str):
+            gpus = [int(gpu) for gpu in self.gpus.split(';')]
+        else:
+            gpus = [0]  # fallback
         args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path, "enable_remask": self.enable_remask}
         args = EvalConfig(**args)
         args.tp_size = len(gpus)
