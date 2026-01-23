@@ -11,10 +11,10 @@ source /data/miniconda3/etc/profile.d/conda.sh
 conda activate dinfer
 
 parallel_decoding='threshold' # or hierarchy
-length=64 # generate length (ParallelBench tasks typically need 32-64 tokens)
+length=32 # generate length (ParallelBench tasks typically need 32-64 tokens)
 block_length=32 # block length
 model_path='/data/models/LLaDA2.0-mini-preview' # your model path
-threshold=0.90 # threshold for parallel decoding
+threshold=0.80 # threshold for parallel decoding
 low_threshold=0.62 # low threshold for parallel decoding when using hierarchy mechanism
 cache='prefix' # or 'prefix' for prefix cache; or '' if you don't want to use cache
 warmup_times=0 # warmup times for cache
