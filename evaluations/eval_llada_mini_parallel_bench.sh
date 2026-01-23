@@ -1,0 +1,42 @@
+# Set the environment variables first before running the command.
+export HF_ALLOW_CODE_EVAL=1
+export HF_DATASETS_TRUST_REMOTE_CODE=1
+export TRANSFORMERS_TRUST_REMOTE_CODE=1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+parallel_decoding='threshold' # or hierarchy
+length=64 # generate length (ParallelBench tasks typically need 32-64 tokens)
+block_length=32 # block length
+model_path='/data/models/LLaDA2.0-mini-preview' # your model path
+threshold=0.80 # threshold for parallel decoding
+low_threshold=0.62 # low threshold for parallel decoding when using hierarchy mechanism
+cache='prefix' # or 'prefix' for prefix cache; or '' if you don't want to use cache
+warmup_times=0 # warmup times for cache
+prefix_look=0
+after_look=0
+cont_weight=0 # cont weight
+use_credit=False # enable credit for threshold mechanism
+use_compile=True # use compile
+tp_size=4 # tensor parallel size
+gpus='0;1;2;3' # gpus for tensor parallel inference
+parallel='tp' # 'tp' for tensor parallel or 'dp' for data parallel
+output_dir='./outputs' # your customer output path
+model_type='llada2' # llada2 (for llada2-mini) 
+use_bd=True # use block diffusion
+master_port="23456"
+save_samples=False # save samples
+# ParallelBench tasks: waiting_line tasks, puzzle tasks, paraphrase_summarize tasks
+if [ "${parallel}" = "tp" ]; then
+  for task in waiting_line_copy waiting_line_reverse waiting_line_sort waiting_line_shuffle puzzle_sudoku_n4_12 paraphrase_summarize_samsum; do
+    output_path=${output_dir}/${task}
+    python eval_dinfer_sglang.py --tasks ${task} \
+    --confirm_run_unsafe_code --model dInfer_eval \
+    --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},prefix_look=${prefix_look},after_look=${after_look},gpus=${gpus},model_type=${model_type},use_bd=${use_bd},master_port=${master_port},save_samples=${save_samples} \
+    --output_path ${output_path} --include_path "$(pwd)/tasks/parallel_bench" --apply_chat_template
+  done
+else
+  echo "parallel must be tp"
+fi

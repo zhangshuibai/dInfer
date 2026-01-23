@@ -1,0 +1,23 @@
+task: paraphrase_summarize_samsum
+dataset_path: json
+dataset_name: null
+dataset_kwargs:
+  data_files: ../../../../ParallelBench/dataset/parallel_bench/data/output/test/paraphrase_summarize/samsum.jsonl
+  config_name: paraphrase_summarize/samsum
+process_docs: !function adapter.process_docs
+doc_to_text: !function adapter.doc_to_text
+doc_to_target: !function adapter.doc_to_target
+metric_list:
+  - metric: !function adapter.summary_score_metric
+    aggregation: mean
+    higher_is_better: true
+generation_kwargs:
+  until:
+    - "\n\n"
+    - "</s>"
+    - "<|im_end|>"
+  do_sample: false
+  temperature: 0.0
+metadata:
+  version: 1.0
+
