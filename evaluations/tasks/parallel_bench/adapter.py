@@ -67,6 +67,16 @@ def _extract_task_name_from_path(file_path):
     return None
 
 
+# Mapping from YAML task names to ParallelBench task names
+_TASK_NAME_MAP = {
+    "waiting_line_copy": "waiting_line/copy",
+    "waiting_line_reverse": "waiting_line/reverse",
+    "waiting_line_sort": "waiting_line/sort",
+    "waiting_line_shuffle": "waiting_line/shuffle",
+    "sudoku_n4_12": "puzzle/sudoku_n4_12",
+    "samsum": "paraphrase_summarize/samsum",
+}
+
 def process_docs(dataset):
     """
     Convert ParallelBench data format to lm-eval-harness format.
@@ -77,44 +87,84 @@ def process_docs(dataset):
     Returns:
         Processed dataset with 'text' and 'answer' fields
     """
-    # Try to infer task_name from various sources
+    # Extract task_name from YAML file path in call stack (most reliable method)
     task_name = None
+    import inspect
+    for frame in inspect.stack():
+        filename = frame.filename
+        if 'parallel_bench' in filename and filename.endswith('.yaml'):
+            yaml_task = Path(filename).stem
+            task_name = _TASK_NAME_MAP.get(yaml_task)
+            if task_name:
+                break
+        
+        # Also try to get task name from config object in frame locals
+        frame_locals = frame.frame.f_locals
+        if 'self' in frame_locals:
+            config = getattr(frame_locals['self'], 'config', None)
+            if config is not None:
+                task_config = getattr(config, 'task', None)
+                if task_config:
+                    task_name = _TASK_NAME_MAP.get(task_config)
+                    if task_name:
+                        break
     
-    # Method 1: Check config_name in dataset attributes (set via dataset_kwargs in YAML)
-    # In lm-eval, dataset_kwargs are passed to load_dataset, but config_name might
-    # be stored in dataset.info or as an attribute
-    if hasattr(dataset, 'config_name') and dataset.config_name:
-        task_name = dataset.config_name
-    
-    # Method 2: Try to get from dataset info
-    if task_name is None and hasattr(dataset, 'info'):
-        if hasattr(dataset.info, 'config_name') and dataset.info.config_name:
-            task_name = dataset.info.config_name
-        # Also check if info has description or other fields
-        if task_name is None and hasattr(dataset.info, 'description'):
-            task_name = _extract_task_name_from_path(dataset.info.description)
-    
-    # Method 3: Try to extract from split name
-    if task_name is None and hasattr(dataset, 'split') and dataset.split:
-        if '/' in dataset.split:
-            task_name = dataset.split
-    
-    # Method 4: Try to extract from file path in dataset's internal structure
+    # Fallback: try to extract from dataset's data_files
     if task_name is None:
-        # Check if we can access the original file path
-        # HuggingFace datasets sometimes store this in _data_files
+        builder = getattr(dataset, '_builder', None)
+        if builder is not None and hasattr(builder, 'data_files'):
+            data_files = builder.data_files
+            if isinstance(data_files, dict):
+                for split_files in data_files.values():
+                    files = split_files if isinstance(split_files, list) else [split_files]
+                    for file_path in files:
+                        task_name = _extract_task_name_from_path(str(file_path))
+                        if task_name:
+                            break
+                    if task_name:
+                        break
+            elif isinstance(data_files, list):
+                for file_path in data_files:
+                    task_name = _extract_task_name_from_path(str(file_path))
+                    if task_name:
+                        break
+            else:
+                task_name = _extract_task_name_from_path(str(data_files))
+    
+    # Additional fallback: try to get from dataset's _data_files attribute
+    if task_name is None:
         if hasattr(dataset, '_data_files') and dataset._data_files:
-            for file_path in dataset._data_files:
-                extracted = _extract_task_name_from_path(file_path)
-                if extracted:
-                    task_name = extracted
+            files = dataset._data_files if isinstance(dataset._data_files, list) else [dataset._data_files]
+            for file_path in files:
+                task_name = _extract_task_name_from_path(str(file_path))
+                if task_name:
                     break
+    
+    # Additional fallback: try to get from dataset info
+    if task_name is None:
+        info = getattr(dataset, 'info', None)
+        if info is not None:
+            # Check if dataset has a description or other metadata with file path
+            description = getattr(info, 'description', '')
+            if description:
+                task_name = _extract_task_name_from_path(description)
+    
+    # Final fallback: try to extract from any string attributes in dataset
+    if task_name is None:
+        # Check dataset's cache_files attribute if available
+        cache_files = getattr(dataset, 'cache_files', None)
+        if cache_files:
+            for cache_file in cache_files if isinstance(cache_files, list) else [cache_files]:
+                if cache_file:
+                    task_name = _extract_task_name_from_path(str(cache_file))
+                    if task_name:
+                        break
     
     if task_name is None:
         raise ValueError(
-            "Could not infer task_name from dataset. "
-            "Please ensure 'config_name' is set in dataset_kwargs in the YAML file, "
-            "or the data file path follows the pattern: .../test/task_category/task_name.jsonl"
+            "Could not determine task_name. "
+            "Please ensure the YAML file name is in _TASK_NAME_MAP or the data file path "
+            "follows pattern: .../test/task_category/task_name.jsonl"
         )
     
     return _process_docs_impl(dataset, task_name)
@@ -122,44 +172,65 @@ def process_docs(dataset):
 def _process_docs_impl(dataset, task_name):
     """Internal implementation of process_docs with explicit task_name."""
     
-    pb = load_parallel_bench_task(task_name)
+    # Load ParallelBench task to get the prompt template (with instruction)
+    pb_task = load_parallel_bench_task(task_name, split="test")
+    prompt_template = pb_task.prompt
     
-    def _process(doc, idx):
-        # Get sample from ParallelBench using index
-        if idx >= len(pb):
-            idx = idx % len(pb)
+    # Process dataset directly - convert from ParallelBench JSONL format to lm_eval format
+    def _process(doc):
+        # Extract input and answer from the dataset document
+        input_data = doc.get("input", {})
+        answer = doc.get("answer", "")
         
-        sample = pb[idx]
-        
-        # Extract messages (already formatted by ParallelBench)
-        messages = sample["input"]["messages"]
-        
-        # Build prompt text with few-shot examples if present
-        prompt_parts = []
-        for i in range(0, len(messages) - 1, 2):
-            if i + 1 < len(messages):
-                prompt_parts.append(f"User: {messages[i]['content']}")
-                prompt_parts.append(f"Assistant: {messages[i+1]['content']}")
-                prompt_parts.append("")
-        
-        # Add the final user message
-        prompt_parts.append(f"User: {messages[-1]['content']}")
-        prompt_text = "\n".join(prompt_parts)
-        
-        # Extract answer
-        answer = sample["label"]
-        if isinstance(answer, dict):
-            answer = answer.get("example", answer.get("result", str(answer)))
+        # Handle different input formats
+        if "messages" in input_data:
+            # Format with messages (chat format) - use messages as-is
+            messages = input_data["messages"]
+            prompt_parts = []
+            for i in range(0, len(messages) - 1, 2):
+                if i + 1 < len(messages):
+                    prompt_parts.append(f"User: {messages[i]['content']}")
+                    prompt_parts.append(f"Assistant: {messages[i+1]['content']}")
+                    prompt_parts.append("")
+            
+            # Add the final user message
+            if len(messages) > 0:
+                prompt_parts.append(f"User: {messages[-1]['content']}")
+            prompt_text = "\n".join(prompt_parts)
+        elif "context" in input_data:
+            # Format with context and ICL examples using ParallelBench's prompt template
+            context = input_data.get("context", "")
+            icl_examples = input_data.get("icl_examples", [])
+            
+            # Format few-shot examples using the prompt template
+            few_shot_text = ""
+            for ex in icl_examples:
+                # Format each example using the prompt template
+                ex_input_dict = ex.get("input", {})
+                ex_prompt = prompt_template.format(**ex_input_dict).replace("\\n", "\n")
+                ex_answer = ex.get("answer", "")
+                if isinstance(ex_answer, dict):
+                    ex_answer = ex_answer.get("example", str(ex_answer))
+                few_shot_text += f"{ex_prompt}\n{ex_answer}\n\n"
+            
+            # Format current task using the prompt template
+            current_prompt = prompt_template.format(**input_data).replace("\\n", "\n")
+            
+            # Combine few-shot examples and current task
+            prompt_text = few_shot_text + current_prompt
+        else:
+            # Fallback: use the input as-is
+            prompt_text = str(input_data)
         
         return {
             "text": prompt_text,
             "answer": answer,
             "_task": task_name,
-            "_metadata": sample.get("metadata", {}),
-            "_original_idx": idx
+            "_metadata": doc.get("metadata", {}),
+            "output_format": doc.get("output_format", "")
         }
     
-    return dataset.map(_process, with_indices=True)
+    return dataset.map(_process)
 
 
 def doc_to_text(doc):
@@ -169,28 +240,110 @@ def doc_to_text(doc):
 
 def doc_to_target(doc):
     """Extract target answer for lm-eval."""
-    return doc["answer"]
+    answer = doc["answer"]
+    # For tasks like shuffle, answer is a dict with "input" and "example"
+    # Return the dict as-is so metric functions can access the "input" field
+    return answer
 
 
 # Metric wrappers for lm-eval-harness
 def _wrap_metric(metric_func, metric_name):
     """Wrap ParallelBench metric function for lm-eval format."""
     def metric_fn(predictions, references):
+        # Ensure inputs are lists
+        if not isinstance(predictions, (list, tuple)):
+            predictions = [predictions]
+        if not isinstance(references, (list, tuple)):
+            references = [references]
+        
         scores = []
-        for pred, ref in zip(predictions, references):
-            # Handle dict references (for tasks like shuffle)
-            if isinstance(ref, dict):
-                score = metric_func(pred, ref, strict=False)
-            else:
-                score = metric_func(pred, ref, strict=False)
+        for i, (pred, ref) in enumerate(zip(predictions, references)):
+            # Clean prediction - remove "Output: " prefix if present
+            if isinstance(pred, str) and pred.startswith("Output:"):
+                pred = pred.replace("Output:", "").strip()
+            
+            try:
+                # Call metric function
+                if isinstance(ref, dict):
+                    score = metric_func(pred, ref, strict=False)
+                else:
+                    score = metric_func(pred, ref, strict=False)
+            except Exception as e:
+                # If metric function fails, return 0.0
+                print(f"Warning: Metric {metric_name} failed for prediction {i}: {e}")
+                score = 0.0
             
             # Handle dict return values
             if isinstance(score, dict):
                 score = score.get("score", 0.0)
             
-            scores.append(float(score))
+            # Recursively unwrap nested structures
+            max_depth = 10
+            depth = 0
+            while isinstance(score, (list, tuple)) and depth < max_depth:
+                if len(score) == 0:
+                    score = 0.0
+                    break
+                # If all elements are numeric, average them
+                try:
+                    numeric_scores = [float(x) for x in score if isinstance(x, (int, float, str))]
+                    if numeric_scores:
+                        score = sum(numeric_scores) / len(numeric_scores)
+                        break
+                except (ValueError, TypeError):
+                    pass
+                # Otherwise take first element and continue unwrapping
+                score = score[0]
+                depth += 1
+            
+            # If still a list/tuple, force to 0.0
+            if isinstance(score, (list, tuple)):
+                score = 0.0
+            
+            # Convert to float - handle all possible types
+            try:
+                if score is None:
+                    score = 0.0
+                elif isinstance(score, bool):
+                    score = 1.0 if score else 0.0
+                else:
+                    score = float(score)
+            except (ValueError, TypeError) as e:
+                print(f"Warning: Could not convert score to float at index {i}: {score} (type: {type(score)}), error: {e}")
+                score = 0.0
+            
+            # Final check - must be a number
+            if not isinstance(score, (int, float)):
+                print(f"Error: Score at index {i} is not numeric after conversion: {score} (type: {type(score)}), setting to 0.0")
+                score = 0.0
+            
+            # Ensure it's a float before appending
+            final_score = float(score)
+            scores.append(final_score)
         
-        return scores
+        # Final validation pass - ensure every element is a float and flatten any nested structures
+        result = []
+        for i, s in enumerate(scores):
+            # If somehow we still have a list/tuple, handle it
+            if isinstance(s, (list, tuple)):
+                print(f"Error: Found list/tuple in scores at index {i}: {s}, using 0.0")
+                result.append(0.0)
+            elif isinstance(s, (int, float)):
+                result.append(float(s))
+            else:
+                print(f"Error: Found non-numeric value in scores at index {i}: {s} (type: {type(s)}), using 0.0")
+                result.append(0.0)
+        
+        # Double check - ensure no nested structures remain
+        final_result = []
+        for i, val in enumerate(result):
+            if isinstance(val, (list, tuple)):
+                print(f"Critical Error: Still found list/tuple at index {i}: {val}")
+                final_result.append(0.0)
+            else:
+                final_result.append(float(val))
+        
+        return final_result
     
     metric_fn.__name__ = metric_name
     return metric_fn

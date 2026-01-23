@@ -1,14 +1,16 @@
-task: waiting_line_shuffle
+task: paraphrase_summarize_samsum
+fewshot_split: null
+validation_split: null
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
-  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/shuffle.jsonl
-  config_name: waiting_line/shuffle
+  split: train
+  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/paraphrase_summarize/samsum.jsonl
 process_docs: !function adapter.process_docs
 doc_to_text: !function adapter.doc_to_text
 doc_to_target: !function adapter.doc_to_target
 metric_list:
-  - metric: !function adapter.list_shuffle_score_metric
+  - metric: !function adapter.summary_score_metric
     aggregation: mean
     higher_is_better: true
 generation_kwargs:

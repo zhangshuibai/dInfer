@@ -1,14 +1,14 @@
-task: puzzle_sudoku_n4_12
+task: waiting_line_copy
+test_split: train
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
-  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/puzzle/sudoku_n4_12.jsonl
-  config_name: puzzle/sudoku_n4_12
+  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/copy.jsonl
 process_docs: !function adapter.process_docs
 doc_to_text: !function adapter.doc_to_text
 doc_to_target: !function adapter.doc_to_target
 metric_list:
-  - metric: !function adapter.sudoku_score_metric
+  - metric: !function adapter.list_match_score_metric
     aggregation: mean
     higher_is_better: true
 generation_kwargs:
@@ -20,4 +20,3 @@ generation_kwargs:
   temperature: 0.0
 metadata:
   version: 1.0
-

@@ -1,9 +1,11 @@
 task: waiting_line_reverse
+fewshot_split: null
+validation_split: null
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
+  split: train
   data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/reverse.jsonl
-  config_name: waiting_line/reverse
 process_docs: !function adapter.process_docs
 doc_to_text: !function adapter.doc_to_text
 doc_to_target: !function adapter.doc_to_target
