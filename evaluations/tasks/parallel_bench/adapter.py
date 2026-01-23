@@ -11,53 +11,32 @@ PARALLEL_BENCH_PATH = Path(__file__).parent.parent.parent.parent / "ParallelBenc
 PARALLEL_BENCH_PATH_STR = str(PARALLEL_BENCH_PATH.resolve())
 
 # Lazy import to avoid circular import issues
+# Simplified ParallelBench import
 def _import_parallel_bench():
-    """Lazy import ParallelBench to avoid circular imports."""
-    import sys as sys_module
+    """Import ParallelBench with manual utils setup."""
+    # Set up ParallelBench path
+    if PARALLEL_BENCH_PATH_STR not in sys.path:
+        sys.path.insert(0, PARALLEL_BENCH_PATH_STR)
     
-    # Save original state
-    original_path = sys.path[:]
-    original_modules = {}
+    # Create utils module manually to avoid conflicts
+    import types
+    utils_module = types.ModuleType("utils")
     
-    # Temporarily remove 'utils' from sys.modules if it exists and is our module
-    # This allows ParallelBench to import its own utils package
-    utils_module_key = None
-    for key in list(sys.modules.keys()):
-        if key == 'utils' and hasattr(sys.modules[key], '__file__'):
-            mod_file = Path(sys.modules[key].__file__)
-            if 'parallel_bench' in str(mod_file) and mod_file.name == 'utils.py':
-                # This is our utils.py, save and remove it
-                original_modules[key] = sys.modules.pop(key)
-                utils_module_key = key
-                break
+    # Load grammar_check into utils module
+    grammar_path = PARALLEL_BENCH_PATH / "utils" / "grammar_check.py"
+    with open(grammar_path, "r") as f:
+        grammar_code = f.read()
+    exec(grammar_code, utils_module.__dict__)
     
-    # Remove current directory and parent directories that might conflict
-    current_file_dir = str(Path(__file__).parent.resolve())
-    current_file_parent = str(Path(__file__).parent.parent.resolve())
-    current_file_grandparent = str(Path(__file__).parent.parent.parent.resolve())
+    # Add to sys.modules
+    sys.modules["utils"] = utils_module
+    sys.modules["utils.grammar_check"] = utils_module
     
-    # Remove conflicting paths (our utils.py locations)
-    paths_to_remove = [current_file_dir, current_file_parent, current_file_grandparent]
-    for path in paths_to_remove:
-        while path in sys.path:
-            sys.path.remove(path)
+    # Now import ParallelBench
+    from dataset.parallel_bench import ParallelBench
+    from dataset.parallel_bench.metrics import parallel_bench_metric_func_map
     
-    # Ensure ParallelBench root is at the front of sys.path
-    if PARALLEL_BENCH_PATH_STR in sys.path:
-        sys.path.remove(PARALLEL_BENCH_PATH_STR)
-    sys.path.insert(0, PARALLEL_BENCH_PATH_STR)
-    
-    try:
-        # Now import - Python will find ParallelBench's utils package (directory) first
-        from dataset.parallel_bench import ParallelBench
-        from dataset.parallel_bench.metrics import parallel_bench_metric_func_map
-        return ParallelBench, parallel_bench_metric_func_map
-    finally:
-        # Restore original sys.path
-        sys.path[:] = original_path
-        # Restore our utils module if it was removed
-        if utils_module_key and utils_module_key in original_modules:
-            sys.modules[utils_module_key] = original_modules[utils_module_key]
+    return ParallelBench, parallel_bench_metric_func_map
 
 # Global cache for ParallelBench instances
 _task_cache = {}

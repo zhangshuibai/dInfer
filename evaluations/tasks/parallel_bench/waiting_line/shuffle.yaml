@@ -2,7 +2,7 @@ task: waiting_line_shuffle
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
-  data_files: ../../../../ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/shuffle.jsonl
+  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/shuffle.jsonl
   config_name: waiting_line/shuffle
 process_docs: !function adapter.process_docs
 doc_to_text: !function adapter.doc_to_text

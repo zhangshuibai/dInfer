@@ -2,7 +2,7 @@ task: puzzle_sudoku_n4_12
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
-  data_files: ../../../../ParallelBench/dataset/parallel_bench/data/output/test/puzzle/sudoku_n4_12.jsonl
+  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/puzzle/sudoku_n4_12.jsonl
   config_name: puzzle/sudoku_n4_12
 process_docs: !function adapter.process_docs
 doc_to_text: !function adapter.doc_to_text

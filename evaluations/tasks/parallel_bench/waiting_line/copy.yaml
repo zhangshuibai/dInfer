@@ -2,7 +2,7 @@ task: waiting_line_copy
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
-  data_files: ../../../../ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/copy.jsonl
+  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/copy.jsonl
   # Set config_name to help process_docs infer task name
   config_name: waiting_line/copy
 process_docs: !function adapter.process_docs
