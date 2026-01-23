@@ -31,9 +31,12 @@ model_type='llada2' # llada2 (for llada2-mini)
 use_bd=True # use block diffusion
 master_port="23457"
 save_samples=True # save samples (set to True for debugging)
+#waiting_line_copy waiting_line_reverse waiting_line_shuffle waiting_line_sort
+#waiting_line_insert_index waiting_line_insert_random waiting_line_remove_index waiting_line_remove_random waiting_line_replace_index waiting_line_replace_random
+
 # ParallelBench tasks: waiting_line tasks, puzzle tasks, paraphrase_summarize tasks
 if [ "${parallel}" = "tp" ]; then
-  for task in waiting_line_shuffle waiting_line_copy; do
+  for task in waiting_line_insert_random waiting_line_remove_index waiting_line_remove_random waiting_line_replace_index waiting_line_replace_random; do
     # Format threshold: replace dot with underscore for folder name (e.g., 0.80 -> 0_80)
     threshold_str=$(echo ${threshold} | tr '.' '_')
     # Loop through enable_remask values (True and False)

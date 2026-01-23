@@ -73,6 +73,12 @@ _TASK_NAME_MAP = {
     "waiting_line_reverse": "waiting_line/reverse",
     "waiting_line_sort": "waiting_line/sort",
     "waiting_line_shuffle": "waiting_line/shuffle",
+    "waiting_line_insert_index": "waiting_line/insert_index",
+    "waiting_line_insert_random": "waiting_line/insert_random",
+    "waiting_line_remove_index": "waiting_line/remove_index",
+    "waiting_line_remove_random": "waiting_line/remove_random",
+    "waiting_line_replace_index": "waiting_line/replace_index",
+    "waiting_line_replace_random": "waiting_line/replace_random",
     "sudoku_n4_12": "puzzle/sudoku_n4_12",
     "samsum": "paraphrase_summarize/samsum",
 }

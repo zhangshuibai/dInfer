@@ -110,7 +110,18 @@ def generate_parallel_bench_insert_task(rng, task_config):
     # min_length = task_config.pop("min_length") - 1  # to leave space for the inserted word
     
     for input_list in generate_word_lists(rng, **task_config):  # , min_length=min_length, max_length=max_length)
-        word_to_insert = rng.choice(list_difference(task_config["words"], input_list))
+        # Check if input_list has duplicates (shouldn't happen, but safety check)
+        if len(set(input_list)) != len(input_list):
+            continue  # Skip if input_list has duplicates
+        
+        available_words = list_difference(task_config["words"], input_list)
+        if not available_words:
+            continue  # Skip if no available words to insert
+        word_to_insert = rng.choice(available_words)
+        
+        # Double-check word_to_insert is not in input_list
+        if word_to_insert in input_list:
+            continue  # Skip if word_to_insert is already in input_list
 
         input = {
             "context": list_to_str(input_list),
@@ -122,7 +133,9 @@ def generate_parallel_bench_insert_task(rng, task_config):
         target_list = input_list[:]
         target_list.insert(index_to_insert, word_to_insert)
 
-        assert len(set(target_list)) == len(target_list), "Target list must not contain duplicates"
+        # Final check (should always pass now, but keep for safety)
+        if len(set(target_list)) != len(target_list):
+            continue  # Skip if target_list has duplicates
 
         if not task_config["random_index"]:
             input["index"] = index_to_insert
@@ -130,9 +143,10 @@ def generate_parallel_bench_insert_task(rng, task_config):
         else:
             index_to_insert = None
             answer = {"input": input_list, "word": word_to_insert, "example": list_to_str(target_list)}
-
-            assert len(set(input_list)) == len(input_list), "Target list must not contain duplicates"
-            assert word_to_insert not in input_list, "Inserted word must not be in the input list"
+            
+            # Final safety checks (should always pass due to earlier checks)
+            if len(set(input_list)) != len(input_list) or word_to_insert in input_list:
+                continue
 
         yield {
             "input": input,
@@ -157,7 +171,9 @@ def generate_parallel_bench_remove_task(rng, task_config):
         target_list = input_list[:]
         target_list.pop(index_to_remove)
 
-        assert len(set(target_list)) == len(target_list), "Target list must not contain duplicates"
+        # Check for duplicates (shouldn't happen, but safety check)
+        if len(set(target_list)) != len(target_list):
+            continue  # Skip if target_list has duplicates
 
         if not task_config["random_index"]:
             input["index"] = index_to_remove
@@ -178,7 +194,18 @@ def generate_parallel_bench_remove_task(rng, task_config):
 
 def generate_parallel_bench_replace_task(rng, task_config):
     for input_list in generate_word_lists(rng, **task_config):
-        new_word = rng.choice(list_difference(task_config["words"], input_list))
+        # Check if input_list has duplicates (shouldn't happen, but safety check)
+        if len(set(input_list)) != len(input_list):
+            continue  # Skip if input_list has duplicates
+        
+        available_words = list_difference(task_config["words"], input_list)
+        if not available_words:
+            continue  # Skip if no available words to replace
+        new_word = rng.choice(available_words)
+        
+        # Double-check new_word is not in input_list
+        if new_word in input_list:
+            continue  # Skip if new_word is already in input_list
 
         input = {
             "context": list_to_str(input_list),
@@ -190,7 +217,9 @@ def generate_parallel_bench_replace_task(rng, task_config):
         target_list = input_list[:]
         target_list[index_to_replace] = new_word
 
-        assert len(set(target_list)) == len(target_list), "Target list must not contain duplicates"
+        # Final check (should always pass now, but keep for safety)
+        if len(set(target_list)) != len(target_list):
+            continue  # Skip if target_list has duplicates
 
         if not task_config["random_index"]:
             input["index"] = index_to_replace
@@ -198,9 +227,10 @@ def generate_parallel_bench_replace_task(rng, task_config):
         else:
             index_to_replace = None
             answer = {"input": input_list, "word": new_word, "example": list_to_str(target_list)}
-
-            assert len(set(input_list)) == len(input_list), "Target list must not contain duplicates"
-            assert new_word not in input_list, "Inserted word must not be in the input list"
+            
+            # Final safety checks (should always pass due to earlier checks)
+            if len(set(input_list)) != len(input_list) or new_word in input_list:
+                continue
 
         yield {
             "input": input,
@@ -452,10 +482,14 @@ def create_parallel_bench_task(split, task, output_file, rng=None, no_save=False
     data = _create_task(rng, task)
 
     if task.get("icl_example_count", 0) > 0:
-        icl_datasets = [create_parallel_bench_task_random(rng=rng, task={**task, "icl_example_count": 0}) for t in range(task["icl_example_count"])]
+        # Generate ICL datasets using infinite generator to ensure enough samples
+        icl_generators = [
+            generate_parallel_bench_task_random(rng=rng, task_config={**task, "icl_example_count": 0}, infinite=True)
+            for t in range(task["icl_example_count"])
+        ]
 
         for i, sample in enumerate(data):
-            sample["input"]["icl_examples"] = [icl_dataset[i] for icl_dataset in icl_datasets]
+            sample["input"]["icl_examples"] = [next(icl_gen) for icl_gen in icl_generators]
 
     if not no_save:
         if not isinstance(data, pd.DataFrame):

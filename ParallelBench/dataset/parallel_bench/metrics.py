@@ -64,9 +64,18 @@ def _extract_numbers_from_str(input_str):
 
 def list_match_score(prediction, ground_truth, strict=False):
     prediction_list = _parse_list(prediction, strict)
-    gt_list = _parse_list(ground_truth)
+    
+    # Handle dict format (from adapter): extract the expected output
+    if isinstance(ground_truth, dict):
+        # For copy/match tasks, use 'example' if available, otherwise 'input'
+        gt_list = ground_truth.get('example', ground_truth.get('input'))
+        if isinstance(gt_list, str):
+            gt_list = _parse_list(gt_list)
+        # If gt_list is already a list, use it directly
+    else:
+        gt_list = _parse_list(ground_truth)
 
-    if prediction_list is None:
+    if prediction_list is None or gt_list is None:
         return 0.0
 
     return float(prediction_list == gt_list)

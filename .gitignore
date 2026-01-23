@@ -6,3 +6,5 @@ python/dinfer.egg-info
 evaluations/tasks/mbpp_sanitized/__pycache__/*
 # evaluation outputs
 /evaluations/outputs_exp/
+ParallelBench/dataset/parallel_bench/data/__pycache__/*
+ParallelBench/dataset/parallel_bench/data/output/train/*

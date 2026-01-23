@@ -1,12 +1,8 @@
 task: waiting_line_sort
-fewshot_split: null
-validation_split: null
+test_split: train
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
-  split: train
-  split: train
-  split: train
   data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/sort.jsonl
 process_docs: !function adapter.process_docs
 doc_to_text: !function adapter.doc_to_text

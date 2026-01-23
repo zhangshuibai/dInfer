@@ -45,9 +45,12 @@ TASK_METRIC_MAP = {
     "waiting_line_copy": list_match_score_metric,            # Copy: exact match required
     "waiting_line_reverse": list_match_score_metric,         # Reverse: exact match required
     "waiting_line_sort": list_match_score_metric,            # Sort: exact match required
-    "waiting_line_insert": list_random_insert_score_metric, # Insert: checks if element inserted correctly
-    "waiting_line_remove": list_random_remove_score_metric, # Remove: checks if element removed correctly
-    "waiting_line_replace": list_random_replace_score_metric, # Replace: checks if element replaced correctly
+    "waiting_line_insert_index": list_match_score_metric,    # Insert at index: exact match required
+    "waiting_line_insert_random": list_random_insert_score_metric, # Insert random: checks if element inserted correctly
+    "waiting_line_remove_index": list_match_score_metric,    # Remove at index: exact match required
+    "waiting_line_remove_random": list_random_remove_score_metric, # Remove random: checks if element removed correctly
+    "waiting_line_replace_index": list_match_score_metric,  # Replace at index: exact match required
+    "waiting_line_replace_random": list_random_replace_score_metric, # Replace random: checks if element replaced correctly
 }
 
 # Task name -> ground truth data file path mapping
@@ -56,6 +59,12 @@ TASK_DATA_MAP = {
     "waiting_line_copy": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/copy.jsonl",
     "waiting_line_reverse": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/reverse.jsonl",
     "waiting_line_sort": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/sort.jsonl",
+    "waiting_line_insert_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/insert_index.jsonl",
+    "waiting_line_insert_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/insert_random.jsonl",
+    "waiting_line_remove_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/remove_index.jsonl",
+    "waiting_line_remove_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/remove_random.jsonl",
+    "waiting_line_replace_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/replace_index.jsonl",
+    "waiting_line_replace_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/replace_random.jsonl",
 }
 
 
@@ -84,15 +93,29 @@ def extract_task_name_from_results(output_dir: Path) -> str:
 def extract_task_name(dir_path: str) -> str:
     """Extract task name from directory path (fallback method)"""
     dir_name = Path(dir_path).name
-    # Try exact match first
-    for task_name in TASK_METRIC_MAP.keys():
+    
+    # Remove common suffixes to get clean task name
+    dir_name_clean = dir_name
+    for suffix in ['_threshold_0_90', '_threshold_0_80', '_remask_True', '_remask_False']:
+        if suffix in dir_name_clean:
+            dir_name_clean = dir_name_clean.replace(suffix, '')
+    # Handle remaining threshold patterns
+    if '_threshold_' in dir_name_clean:
+        dir_name_clean = dir_name_clean.split('_threshold_')[0]
+    if '_remask_' in dir_name_clean:
+        dir_name_clean = dir_name_clean.split('_remask_')[0]
+    
+    # Try to match known task names - sort by length (longest first) to avoid partial matches
+    task_names = sorted(TASK_METRIC_MAP.keys(), key=len, reverse=True)
+    for task_name in task_names:
+        if dir_name_clean == task_name or dir_name_clean.startswith(task_name + '_'):
+            return task_name
+    
+    # Fallback: try substring match in original dir_name
+    for task_name in task_names:
         if task_name in dir_name:
             return task_name
-    # Fallback: parse from directory name pattern (e.g., "waiting_line_shuffle_threshold_0_90")
-    parts = dir_name.split('_')
-    if 'waiting_line' in dir_name:
-        idx = parts.index('waiting_line')
-        return f"waiting_line_{parts[idx+1]}"
+    
     raise ValueError(f"Cannot determine task from: {dir_path}")
 
 
