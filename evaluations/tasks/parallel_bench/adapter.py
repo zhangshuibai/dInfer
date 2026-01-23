@@ -263,24 +263,60 @@ def _wrap_metric(metric_func, metric_name):
         
         scores = []
         for i, (pred, ref) in enumerate(zip(predictions, references)):
+            # Debug: print input types
+            print(f"DEBUG {metric_name} sample {i}: pred type={type(pred).__name__}, ref type={type(ref).__name__}")
+            print(f"DEBUG {metric_name} sample {i}: pred[:100]={str(pred)[:100]}")
+            print(f"DEBUG {metric_name} sample {i}: ref[:200]={str(ref)[:200]}")
+            
             # Clean prediction - remove "Output: " prefix if present
             if isinstance(pred, str) and pred.startswith("Output:"):
                 pred = pred.replace("Output:", "").strip()
             
             # Handle reference format - try to convert to dict
+            original_ref_type = type(ref).__name__
             if isinstance(ref, str):
+                # Try JSON first
                 try:
                     import json
                     ref = json.loads(ref)
+                    print(f"DEBUG {metric_name} sample {i}: Parsed ref from string as JSON, new type={type(ref).__name__}")
                 except Exception:
-                    pass
+                    # Try Python literal_eval for Python repr format (e.g., {'input': [...], 'example': '...'})
+                    try:
+                        import ast
+                        ref = ast.literal_eval(ref)
+                        print(f"DEBUG {metric_name} sample {i}: Parsed ref from string as Python literal, new type={type(ref).__name__}")
+                    except Exception as e:
+                        print(f"DEBUG {metric_name} sample {i}: Failed to parse ref: {e}")
+                        pass
+            
+            # Unwrap single-element lists
             if isinstance(ref, list) and len(ref) == 1:
                 ref = ref[0]
+                print(f"DEBUG {metric_name} sample {i}: Unwrapped single-element list, new type={type(ref).__name__}")
             
-            # If ref is not a dict, set score to 0.0
+            # Handle different reference formats based on task type
+            # For shuffle tasks: ref should be dict with 'input' and 'example'
+            # For copy tasks: ref might be a list (the expected output)
             if not isinstance(ref, dict):
-                scores.append(0.0)
-                continue
+                # For copy/match tasks, if ref is a list, convert to dict format
+                if ('copy' in metric_name.lower() or 'match' in metric_name.lower()) and isinstance(ref, list):
+                    # For copy/match tasks, the reference is the expected output list
+                    # Convert to dict format: {'input': ref, 'example': ref} (same for copy)
+                    # The metric function expects: input (list) and example (list or JSON string)
+                    import json
+                    ref = {
+                        'input': ref,  # Original list
+                        'example': ref  # Expected output (same as input for copy)
+                    }
+                    print(f"DEBUG {metric_name} sample {i}: Converted list ref to dict format for copy/match task")
+                else:
+                    print(f"WARNING in {metric_name} sample {i}: Reference is not dict (type: {type(ref).__name__}, original: {original_ref_type}), value: {str(ref)[:200]}")
+                    scores.append(0.0)
+                    continue
+            
+            if isinstance(ref, dict):
+                print(f"DEBUG {metric_name} sample {i}: ref is dict with keys: {list(ref.keys())}")
             
             # Call metric function
             try:
@@ -352,12 +388,20 @@ def _wrap_metric(metric_func, metric_name):
             else:
                 final_result.append(float(val))
         
-        # Debug output
-        if len(final_result) > 0:
+        # CRITICAL FIX: If lm-eval calls this function per-sample and expects a single value,
+        # return the first (and only) score as a single float, not a list
+        # But if we have multiple samples, return the list
+        if len(final_result) == 1:
+            # Return single value to avoid nesting when lm-eval collects results
+            ret_value = final_result[0]
+            print(f"DEBUG {metric_name}: Returning single value: {ret_value} (type: {type(ret_value).__name__})")
+            print(f"DEBUG {metric_name}: Input lengths - predictions: {len(predictions)}, references: {len(references)}")
+            return ret_value
+        else:
             types_str = ', '.join([type(x).__name__ for x in final_result[:5]])
             print(f"DEBUG {metric_name}: Returning {len(final_result)} scores: {final_result[:5]}... (types: {types_str})")
-        
-        return final_result
+            print(f"DEBUG {metric_name}: Input lengths - predictions: {len(predictions)}, references: {len(references)}")
+            return final_result
     
     metric_fn.__name__ = metric_name
     return metric_fn

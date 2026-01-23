@@ -14,7 +14,7 @@ parallel_decoding='threshold' # or hierarchy
 length=64 # generate length (ParallelBench tasks typically need 32-64 tokens)
 block_length=32 # block length
 model_path='/data/models/LLaDA2.0-mini-preview' # your model path
-threshold=0.80 # threshold for parallel decoding
+threshold=0.90 # threshold for parallel decoding
 low_threshold=0.62 # low threshold for parallel decoding when using hierarchy mechanism
 cache='prefix' # or 'prefix' for prefix cache; or '' if you don't want to use cache
 warmup_times=0 # warmup times for cache
@@ -34,11 +34,16 @@ save_samples=True # save samples (set to True for debugging)
 # ParallelBench tasks: waiting_line tasks, puzzle tasks, paraphrase_summarize tasks
 if [ "${parallel}" = "tp" ]; then
   for task in waiting_line_shuffle waiting_line_copy; do
-    output_path=${output_dir}/${task}
-    /data/miniconda3/envs/dinfer/bin/python eval_dinfer_sglang.py --tasks ${task} \
-    --confirm_run_unsafe_code --model dInfer_eval \
-    --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},prefix_look=${prefix_look},after_look=${after_look},gpus=${gpus},model_type=${model_type},use_bd=${use_bd},master_port=${master_port},save_samples=${save_samples} \
-    --output_path ${output_path} --include_path "$(pwd)/tasks/parallel_bench" --apply_chat_template --limit 5
+    # Format threshold: replace dot with underscore for folder name (e.g., 0.80 -> 0_80)
+    threshold_str=$(echo ${threshold} | tr '.' '_')
+    # Loop through enable_remask values (True and False)
+    for enable_remask in True False; do
+      output_path=${output_dir}/${task}_${parallel_decoding}_${threshold_str}_remask_${enable_remask}
+      /data/miniconda3/envs/dinfer/bin/python eval_dinfer_sglang.py --tasks ${task} \
+      --confirm_run_unsafe_code --model dInfer_eval \
+      --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},prefix_look=${prefix_look},after_look=${after_look},gpus=${gpus},model_type=${model_type},use_bd=${use_bd},master_port=${master_port},save_samples=${save_samples},enable_remask=${enable_remask} \
+      --output_path ${output_path} --include_path "$(pwd)/tasks/parallel_bench" --apply_chat_template
+    done
   done
 else
   echo "parallel must be tp"
