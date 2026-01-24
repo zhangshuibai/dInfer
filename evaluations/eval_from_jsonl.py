@@ -55,38 +55,38 @@ TASK_METRIC_MAP = {
 
 # Task name -> ground truth data file path mapping
 TASK_DATA_MAP = {
-    "waiting_line_shuffle": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/shuffle.jsonl",
-    "waiting_line_copy": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/copy.jsonl",
-    "waiting_line_reverse": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/reverse.jsonl",
-    "waiting_line_sort": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/sort.jsonl",
-    "waiting_line_insert_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/insert_index.jsonl",
-    "waiting_line_insert_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/insert_random.jsonl",
-    "waiting_line_remove_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/remove_index.jsonl",
-    "waiting_line_remove_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/remove_random.jsonl",
-    "waiting_line_replace_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/replace_index.jsonl",
-    "waiting_line_replace_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/replace_random.jsonl",
+    "waiting_line_shuffle": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/shuffle.jsonl",
+    "waiting_line_copy": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/copy.jsonl",
+    "waiting_line_reverse": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/reverse.jsonl",
+    "waiting_line_sort": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/sort.jsonl",
+    "waiting_line_insert_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/insert_index.jsonl",
+    "waiting_line_insert_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/insert_random.jsonl",
+    "waiting_line_remove_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/remove_index.jsonl",
+    "waiting_line_remove_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/remove_random.jsonl",
+    "waiting_line_replace_index": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/replace_index.jsonl",
+    "waiting_line_replace_random": "/data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/replace_random.jsonl",
 }
 
 
 def extract_task_name_from_results(output_dir: Path) -> str:
     """Extract task name from results JSON file"""
-    # Look for results JSON file in the output directory
-    results_dir = output_dir / "__data__models__LLaDA2.0-mini-preview"
-    if results_dir.exists():
-        # Find the most recent results JSON file
-        results_files = list(results_dir.glob("results_*.json"))
-        if results_files:
-            # Sort by modification time, get the most recent
-            results_file = max(results_files, key=lambda p: p.stat().st_mtime)
-            with open(results_file) as f:
-                results = json.load(f)
-                # Extract task name from configs
-                if "configs" in results and results["configs"]:
-                    task_name = list(results["configs"].keys())[0]
-                    config = results["configs"][task_name]
-                    if "task" in config:
-                        return config["task"]
-                    return task_name
+    # Look for results JSON file in any __data__* subdirectory
+    for subdir in output_dir.iterdir():
+        if subdir.is_dir() and subdir.name.startswith("__data__"):
+            # Find the most recent results JSON file
+            results_files = list(subdir.glob("results_*.json"))
+            if results_files:
+                # Sort by modification time, get the most recent
+                results_file = max(results_files, key=lambda p: p.stat().st_mtime)
+                with open(results_file) as f:
+                    results = json.load(f)
+                    # Extract task name from configs
+                    if "configs" in results and results["configs"]:
+                        task_name = list(results["configs"].keys())[0]
+                        config = results["configs"][task_name]
+                        if "task" in config:
+                            return config["task"]
+                        return task_name
     return None
 
 
@@ -209,7 +209,8 @@ def evaluate(output_dir: str, verbose: bool = False, filter_format: bool = False
     # Try to get task name from results JSON first, fallback to directory name
     task_name = extract_task_name_from_results(output_dir)
     if task_name is None:
-        raise ValueError(f"Cannot determine task from: {output_dir}")
+        # Fallback to extracting from directory name
+        task_name = extract_task_name(str(output_dir))
     metric_func = TASK_METRIC_MAP[task_name]  # Different metric for different tasks
     data_file = TASK_DATA_MAP[task_name]
     

@@ -3,7 +3,7 @@ test_split: train
 dataset_path: json
 dataset_name: null
 dataset_kwargs:
-  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test/waiting_line/replace_index.jsonl
+  data_files: /data/dInfer/ParallelBench/dataset/parallel_bench/data/output/test-aug/waiting_line/replace_index.jsonl
 process_docs: !function adapter.process_docs
 doc_to_text: !function adapter.doc_to_text
 doc_to_target: !function adapter.doc_to_target
