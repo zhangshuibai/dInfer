@@ -11,12 +11,12 @@ PARALLEL_BENCH_PATH = Path(__file__).parent.parent.parent.parent / "ParallelBenc
 sys.path.insert(0, str(PARALLEL_BENCH_PATH))
 
 try:
-    from dataset.parallel_bench.data.task_utils import str_to_latin_square
+from dataset.parallel_bench.data.task_utils import str_to_latin_square
 except ImportError:
     str_to_latin_square = None
 
 try:
-    from utils.grammar_check import grammar_check
+from utils.grammar_check import grammar_check
 except ImportError:
     def grammar_check(text):
         # Fallback if grammar_check not available
