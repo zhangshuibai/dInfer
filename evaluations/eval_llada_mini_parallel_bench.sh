@@ -2,7 +2,7 @@
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_TRUST_REMOTE_CODE=1
 export TRANSFORMERS_TRUST_REMOTE_CODE=1
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=5,6,7
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -14,7 +14,7 @@ parallel_decoding='threshold' # or hierarchy
 length=64 # generate length (ParallelBench tasks typically need 32-64 tokens)
 block_length=32 # block length
 model_path='/data/dFactory/llada2_mini_bd_parallelbench_mixture_sft_outputs/hf_ckpt_split' # your model path
-threshold=0.80 # threshold for parallel decoding
+threshold=0.70 # threshold for parallel decoding
 low_threshold=0.62 # low threshold for parallel decoding when using hierarchy mechanism
 cache='prefix' # or 'prefix' for prefix cache; or '' if you don't want to use cache
 warmup_times=0 # warmup times for cache
