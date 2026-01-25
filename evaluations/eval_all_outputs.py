@@ -87,7 +87,9 @@ def main():
     print(f"Found {len(task_dirs)} task output directories\n")
     
     # 评估所有任务
-    results = []
+    results_all = []  # Results without filtering
+    results_filtered = []  # Results with filtering
+    
     for idx, (model_name, task_dir) in enumerate(task_dirs, 1):
         task_name, threshold, remask = extract_task_info(task_dir)
         
@@ -112,44 +114,63 @@ def main():
             predictions = load_predictions(str(jsonl_file))
             references = load_references(data_file)
             
-            # Calculate filtered count
+            # Evaluate without filtering
+            if args.verbose:
+                score_all = evaluate(str(task_dir), verbose=True, filter_format=False)
+            else:
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    score_all = evaluate(str(task_dir), verbose=False, filter_format=False)
+            
+            # Evaluate with filtering
             filtered_count = 0
+            score_filtered = None
             if args.filter_format:
                 original_count = len(predictions)
                 filtered_predictions, filtered_references, filtered_indices, filtered_count = filter_by_format(
                     predictions, references, False
                 )
+                if args.verbose:
+                    score_filtered = evaluate(str(task_dir), verbose=True, filter_format=True)
+                else:
+                    f = io.StringIO()
+                    with redirect_stdout(f):
+                        score_filtered = evaluate(str(task_dir), verbose=False, filter_format=True)
             else:
-                filtered_count = 0
+                # If filter_format is not enabled, use the same score for both
+                score_filtered = score_all
             
-            # Evaluate
-            if args.verbose:
-                score = evaluate(str(task_dir), verbose=True, filter_format=args.filter_format)
-            else:
-                # Capture output
-                f = io.StringIO()
-                with redirect_stdout(f):
-                    score = evaluate(str(task_dir), verbose=False, filter_format=args.filter_format)
-            
-            results.append({
+            # Add results for both filtered and unfiltered
+            result_base = {
                 'model': model_name,
                 'task': task_name or task_dir.name,
                 'threshold': threshold or 'N/A',
                 'remask': remask,
-                'score': score,
                 'filtered_count': filtered_count,
-                'status': 'success'
+            }
+            
+            results_all.append({
+                **result_base,
+                'score': score_all,
+                'status': 'success' if score_all is not None else 'failed'
             })
             
-            if score is not None:
-                print(f"  ✓ Accuracy: {score*100:.2f}%\n")
-            else:
+            results_filtered.append({
+                **result_base,
+                'score': score_filtered,
+                'status': 'success' if score_filtered is not None else 'failed'
+            })
+            
+            if score_all is not None:
+                print(f"  ✓ Accuracy (All): {score_all*100:.2f}%")
+            if score_filtered is not None:
+                print(f"  ✓ Accuracy (Filtered): {score_filtered*100:.2f}% (Filtered: {filtered_count})")
+            if score_all is None and score_filtered is None:
                 print(f"  ✗ Evaluation failed\n")
-                results[-1]['status'] = 'failed'
                 
         except Exception as e:
             print(f"  ✗ Error: {e}\n")
-            results.append({
+            result_base = {
                 'model': model_name,
                 'task': task_name or task_dir.name,
                 'threshold': threshold or 'N/A',
@@ -158,137 +179,171 @@ def main():
                 'filtered_count': 0,
                 'status': 'error',
                 'error': str(e)
-            })
+            }
+            results_all.append(result_base)
+            results_filtered.append(result_base)
     
-    # Print results table
+    # Print results table for both filtered and unfiltered
     print("\n" + "="*100)
     print("Evaluation Results Summary")
     print("="*100)
     
-    if not results:
+    if not results_all:
         print("No results to display")
         return
     
-    # Group by task, threshold, and remask for comparison
-    # Structure: {(task, threshold, remask): {model: result}}
-    comparison = defaultdict(dict)
-    for r in results:
-        if r['score'] is not None:
-            key = (r['task'], r['threshold'], r['remask'])
-            comparison[key][r['model']] = r
+    # Function to generate comparison table
+    def generate_comparison_table(results, title_suffix=""):
+        # Group by task, threshold, and remask for comparison
+        # Structure: {(task, threshold, remask): {model: result}}
+        comparison = defaultdict(dict)
+        for r in results:
+            if r['score'] is not None:
+                key = (r['task'], r['threshold'], r['remask'])
+                comparison[key][r['model']] = r
+        
+        # Prepare data for CSV export
+        csv_rows = []
+        
+        # Print comparison table
+        print(f"\n{'Task':<35} {'Threshold':<12} {'Remask':<8} {'Base':<12} {'Vanilla':<12} {'Mixture':<12} {'Filtered':<10}")
+        print("-" * 120)
+        
+        # Sort by task, threshold, remask
+        for (task, threshold, remask) in sorted(comparison.keys()):
+            models = comparison[(task, threshold, remask)]
+            base_result = models.get('llada2-base')
+            vanilla_result = models.get('llada2-vanilla')
+            mixture_result = models.get('llada2-mixture')
+            
+            threshold_str = str(threshold)
+            remask_str = 'True' if remask else 'False' if remask is False else 'N/A'
+            
+            base_score = f"{base_result['score']*100:.2f}%" if base_result and base_result['score'] is not None else "N/A"
+            vanilla_score = f"{vanilla_result['score']*100:.2f}%" if vanilla_result and vanilla_result['score'] is not None else "N/A"
+            mixture_score = f"{mixture_result['score']*100:.2f}%" if mixture_result and mixture_result['score'] is not None else "N/A"
+            
+            # Filtered count (show from mixture if available, else vanilla, else base)
+            filtered_result = mixture_result if mixture_result else (vanilla_result if vanilla_result else base_result)
+            filtered_str = str(filtered_result.get('filtered_count', 0)) if filtered_result else "0"
+            filtered_count = filtered_result.get('filtered_count', 0) if filtered_result else 0
+            
+            print(f"{task:<35} {threshold_str:<12} {remask_str:<8} {base_score:<12} {vanilla_score:<12} {mixture_score:<12} {filtered_str:<10}")
+            
+            # Prepare CSV row
+            csv_rows.append({
+                'Task': task,
+                'Threshold': threshold_str,
+                'Remask': remask_str,
+                'Base_Accuracy': base_result['score'] * 100 if base_result and base_result['score'] is not None else None,
+                'Vanilla_Accuracy': vanilla_result['score'] * 100 if vanilla_result and vanilla_result['score'] is not None else None,
+                'Mixture_Accuracy': mixture_result['score'] * 100 if mixture_result and mixture_result['score'] is not None else None,
+                'Filtered_Count': filtered_count
+            })
+        
+        return csv_rows, comparison
     
-    # Prepare data for CSV export
-    csv_rows = []
+    # Generate table for all results (no filtering)
+    print("\n" + "="*100)
+    print("Results WITHOUT Format Filtering")
+    print("="*100)
+    csv_rows_all, comparison_all = generate_comparison_table(results_all, " (All Samples)")
     
-    # Print comparison table
-    print(f"\n{'Task':<35} {'Threshold':<12} {'Remask':<8} {'Base':<12} {'Vanilla':<12} {'Mixture':<12} {'Filtered':<10}")
-    print("-" * 120)
-    
-    # Sort by task, threshold, remask
-    for (task, threshold, remask) in sorted(comparison.keys()):
-        models = comparison[(task, threshold, remask)]
-        base_result = models.get('llada2-base')
-        vanilla_result = models.get('llada2-vanilla')
-        mixture_result = models.get('llada2-mixture')
-        
-        threshold_str = str(threshold)
-        remask_str = 'True' if remask else 'False' if remask is False else 'N/A'
-        
-        base_score = f"{base_result['score']*100:.2f}%" if base_result and base_result['score'] is not None else "N/A"
-        vanilla_score = f"{vanilla_result['score']*100:.2f}%" if vanilla_result and vanilla_result['score'] is not None else "N/A"
-        mixture_score = f"{mixture_result['score']*100:.2f}%" if mixture_result and mixture_result['score'] is not None else "N/A"
-        
-        # Filtered count (show from mixture if available, else vanilla, else base)
-        filtered_result = mixture_result if mixture_result else (vanilla_result if vanilla_result else base_result)
-        filtered_str = str(filtered_result.get('filtered_count', 0)) if filtered_result else "0"
-        filtered_count = filtered_result.get('filtered_count', 0) if filtered_result else 0
-        
-        print(f"{task:<35} {threshold_str:<12} {remask_str:<8} {base_score:<12} {vanilla_score:<12} {mixture_score:<12} {filtered_str:<10}")
-        
-        # Prepare CSV row
-        csv_rows.append({
-            'Task': task,
-            'Threshold': threshold_str,
-            'Remask': remask_str,
-            'Base_Accuracy': base_result['score'] * 100 if base_result and base_result['score'] is not None else None,
-            'Vanilla_Accuracy': vanilla_result['score'] * 100 if vanilla_result and vanilla_result['score'] is not None else None,
-            'Mixture_Accuracy': mixture_result['score'] * 100 if mixture_result and mixture_result['score'] is not None else None,
-            'Filtered_Count': filtered_count
-        })
+    # Generate table for filtered results
+    print("\n" + "="*100)
+    print("Results WITH Format Filtering")
+    print("="*100)
+    csv_rows_filtered, comparison_filtered = generate_comparison_table(results_filtered, " (Filtered)")
     
     # Export to CSV if requested
     if args.csv:
         csv_path = Path(args.csv)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         
-        with open(csv_path, 'w', newline='') as f:
-            if csv_rows:
+        # Export unfiltered results
+        csv_path_all = csv_path.parent / f"{csv_path.stem}_all{csv_path.suffix}"
+        with open(csv_path_all, 'w', newline='') as f:
+            if csv_rows_all:
                 fieldnames = ['Task', 'Threshold', 'Remask', 'Base_Accuracy', 'Vanilla_Accuracy', 'Mixture_Accuracy', 'Filtered_Count']
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
-                writer.writerows(csv_rows)
+                writer.writerows(csv_rows_all)
+        print(f"\n✓ Results (All) exported to CSV: {csv_path_all}")
         
-        print(f"\n✓ Results exported to CSV: {csv_path}")
+        # Export filtered results
+        csv_path_filtered = csv_path.parent / f"{csv_path.stem}_filtered{csv_path.suffix}"
+        with open(csv_path_filtered, 'w', newline='') as f:
+            if csv_rows_filtered:
+                fieldnames = ['Task', 'Threshold', 'Remask', 'Base_Accuracy', 'Vanilla_Accuracy', 'Mixture_Accuracy', 'Filtered_Count']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(csv_rows_filtered)
+        print(f"✓ Results (Filtered) exported to CSV: {csv_path_filtered}")
     
-    # Statistics by model
-    print("\n" + "-" * 100)
-    model_stats = defaultdict(list)
-    for r in results:
-        if r['score'] is not None:
-            model_stats[r['model']].append(r['score'])
+    # Statistics by model (for both filtered and unfiltered)
+    def print_statistics(results, title):
+        print(f"\n{title}")
+        print("-" * 100)
+        model_stats = defaultdict(list)
+        for r in results:
+            if r['score'] is not None:
+                model_stats[r['model']].append(r['score'])
+        
+        if model_stats:
+            print("Statistics by Model:")
+            for model in sorted(model_stats.keys()):
+                scores = model_stats[model]
+                avg = sum(scores) / len(scores)
+                min_score = min(scores)
+                max_score = max(scores)
+                print(f"  {model:<20} Avg: {avg*100:.2f}%, Min: {min_score*100:.2f}%, Max: {max_score*100:.2f}% ({len(scores)} tasks)")
+        
+        # Overall comparison summary
+        print("\n" + "-" * 100)
+        base_scores = [r['score'] for r in results if r['model'] == 'llada2-base' and r['score'] is not None]
+        vanilla_scores = [r['score'] for r in results if r['model'] == 'llada2-vanilla' and r['score'] is not None]
+        mixture_scores = [r['score'] for r in results if r['model'] == 'llada2-mixture' and r['score'] is not None]
+        
+        print(f"Overall Comparison:")
+        if base_scores:
+            base_avg = sum(base_scores) / len(base_scores)
+            print(f"  Base: {base_avg*100:.2f}% ({len(base_scores)} tasks)")
+        if vanilla_scores:
+            vanilla_avg = sum(vanilla_scores) / len(vanilla_scores)
+            print(f"  Vanilla: {vanilla_avg*100:.2f}% ({len(vanilla_scores)} tasks)")
+        if mixture_scores:
+            mixture_avg = sum(mixture_scores) / len(mixture_scores)
+            print(f"  Mixture: {mixture_avg*100:.2f}% ({len(mixture_scores)} tasks)")
+        
+        # Calculate differences if multiple models available
+        if base_scores and vanilla_scores:
+            base_avg = sum(base_scores) / len(base_scores)
+            vanilla_avg = sum(vanilla_scores) / len(vanilla_scores)
+            print(f"  Vanilla - Base: {(vanilla_avg - base_avg)*100:+.2f}%")
+        if vanilla_scores and mixture_scores:
+            vanilla_avg = sum(vanilla_scores) / len(vanilla_scores)
+            mixture_avg = sum(mixture_scores) / len(mixture_scores)
+            print(f"  Mixture - Vanilla: {(mixture_avg - vanilla_avg)*100:+.2f}%")
+        if base_scores and mixture_scores:
+            base_avg = sum(base_scores) / len(base_scores)
+            mixture_avg = sum(mixture_scores) / len(mixture_scores)
+            print(f"  Mixture - Base: {(mixture_avg - base_avg)*100:+.2f}%")
+        
+        # Overall statistics
+        print("\n" + "-" * 100)
+        success_count = sum(1 for r in results if r['status'] == 'success' and r['score'] is not None)
+        failed_count = len(results) - success_count
+        
+        if success_count > 0:
+            avg_score = sum(r['score'] for r in results if r['score'] is not None) / success_count
+            print(f"Total: {len(results)} tasks, Success: {success_count}, Failed: {failed_count}")
+            print(f"Average Accuracy: {avg_score*100:.2f}%")
+        else:
+            print(f"Total: {len(results)} tasks, Success: {success_count}, Failed: {failed_count}")
     
-    if model_stats:
-        print("Statistics by Model:")
-        for model in sorted(model_stats.keys()):
-            scores = model_stats[model]
-            avg = sum(scores) / len(scores)
-            min_score = min(scores)
-            max_score = max(scores)
-            print(f"  {model:<20} Avg: {avg*100:.2f}%, Min: {min_score*100:.2f}%, Max: {max_score*100:.2f}% ({len(scores)} tasks)")
-    
-    # Overall comparison summary
-    print("\n" + "-" * 100)
-    base_scores = [r['score'] for r in results if r['model'] == 'llada2-base' and r['score'] is not None]
-    vanilla_scores = [r['score'] for r in results if r['model'] == 'llada2-vanilla' and r['score'] is not None]
-    mixture_scores = [r['score'] for r in results if r['model'] == 'llada2-mixture' and r['score'] is not None]
-    
-    print(f"Overall Comparison:")
-    if base_scores:
-        base_avg = sum(base_scores) / len(base_scores)
-        print(f"  Base: {base_avg*100:.2f}% ({len(base_scores)} tasks)")
-    if vanilla_scores:
-        vanilla_avg = sum(vanilla_scores) / len(vanilla_scores)
-        print(f"  Vanilla: {vanilla_avg*100:.2f}% ({len(vanilla_scores)} tasks)")
-    if mixture_scores:
-        mixture_avg = sum(mixture_scores) / len(mixture_scores)
-        print(f"  Mixture: {mixture_avg*100:.2f}% ({len(mixture_scores)} tasks)")
-    
-    # Calculate differences if multiple models available
-    if base_scores and vanilla_scores:
-        base_avg = sum(base_scores) / len(base_scores)
-        vanilla_avg = sum(vanilla_scores) / len(vanilla_scores)
-        print(f"  Vanilla - Base: {(vanilla_avg - base_avg)*100:+.2f}%")
-    if vanilla_scores and mixture_scores:
-        vanilla_avg = sum(vanilla_scores) / len(vanilla_scores)
-        mixture_avg = sum(mixture_scores) / len(mixture_scores)
-        print(f"  Mixture - Vanilla: {(mixture_avg - vanilla_avg)*100:+.2f}%")
-    if base_scores and mixture_scores:
-        base_avg = sum(base_scores) / len(base_scores)
-        mixture_avg = sum(mixture_scores) / len(mixture_scores)
-        print(f"  Mixture - Base: {(mixture_avg - base_avg)*100:+.2f}%")
-    
-    # Overall statistics
-    print("\n" + "-" * 100)
-    success_count = sum(1 for r in results if r['status'] == 'success' and r['score'] is not None)
-    failed_count = len(results) - success_count
-    
-    if success_count > 0:
-        avg_score = sum(r['score'] for r in results if r['score'] is not None) / success_count
-        print(f"Total: {len(results)} tasks, Success: {success_count}, Failed: {failed_count}")
-        print(f"Average Accuracy (All): {avg_score*100:.2f}%")
-    else:
-        print(f"Total: {len(results)} tasks, Success: {success_count}, Failed: {failed_count}")
-    
+    print_statistics(results_all, "Statistics WITHOUT Format Filtering")
+    print("\n" + "="*100)
+    print_statistics(results_filtered, "Statistics WITH Format Filtering")
     print("="*100)
 
 
