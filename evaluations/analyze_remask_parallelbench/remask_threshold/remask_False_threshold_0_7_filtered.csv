@@ -1,0 +1,14 @@
+Task,Category,Base_Accuracy,Vanilla_Accuracy,Mixture_Accuracy
+waiting_line_copy,Certain,98.59,99.98,100.0
+waiting_line_reverse,Certain,75.17,100.0,99.94
+waiting_line_sort,Certain,22.39,69.72,68.25
+waiting_line_insert_index,Certain,26.55,99.78,99.64
+waiting_line_remove_index,Certain,38.59,99.94,99.94
+waiting_line_replace_index,Certain,43.01,99.92,99.98
+waiting_line_shuffle,Uncertain,55.33,81.85,79.3
+waiting_line_insert_random,Uncertain,40.96,72.62,69.84
+waiting_line_remove_random,Uncertain,80.09,93.76,91.24
+waiting_line_replace_random,Uncertain,63.8,56.44,62.15
+=== Average (All Tasks) ===,,54.45,87.4,87.03
+=== Average (Certain Tasks) ===,Certain,50.72,94.89,94.62
+=== Average (Uncertain Tasks) ===,Uncertain,60.05,76.17,75.63

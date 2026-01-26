@@ -8,3 +8,9 @@ evaluations/tasks/mbpp_sanitized/__pycache__/*
 /evaluations/outputs_exp/
 ParallelBench/dataset/parallel_bench/data/__pycache__/*
 ParallelBench/dataset/parallel_bench/data/output/train/*
+# Analysis tables
+evaluations/analyze_remask_parallelbench/*.csv
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class

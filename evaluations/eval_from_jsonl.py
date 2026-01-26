@@ -89,7 +89,6 @@ def extract_task_name_from_results(output_dir: Path) -> str:
                         return task_name
     return None
 
-
 def extract_task_name(dir_path: str) -> str:
     """Extract task name from directory path (fallback method)"""
     dir_name = Path(dir_path).name

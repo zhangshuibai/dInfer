@@ -1,0 +1,14 @@
+Task,Category,Base_Remask_False,Base_Remask_True,Vanilla_Remask_False,Vanilla_Remask_True,Mixture_Remask_False,Mixture_Remask_True
+waiting_line_copy,Certain,98.12,98.25,99.98,99.98,100.0,100.0
+waiting_line_reverse,Certain,68.05,70.67,100.0,99.98,99.92,99.92
+waiting_line_sort,Certain,17.12,19.71,62.29,62.08,59.96,63.76
+waiting_line_insert_index,Certain,24.01,25.05,99.66,99.66,99.5,99.5
+waiting_line_remove_index,Certain,36.18,37.91,99.88,99.88,99.94,99.94
+waiting_line_replace_index,Certain,41.07,41.55,99.86,99.88,99.98,99.98
+waiting_line_shuffle,Uncertain,40.04,53.51,47.64,39.34,45.42,63.8
+waiting_line_insert_random,Uncertain,25.42,36.25,40.09,44.22,40.0,71.72
+waiting_line_remove_random,Uncertain,66.82,71.29,74.98,72.39,69.18,76.56
+waiting_line_replace_random,Uncertain,51.93,68.05,24.68,26.36,30.09,37.07
+=== Average (All Tasks) ===,,46.88,52.22,74.91,74.38,74.4,81.23
+=== Average (Certain Tasks) ===,Certain,47.43,48.86,93.61,93.58,93.22,93.85
+=== Average (Uncertain Tasks) ===,Uncertain,46.05,57.27,46.85,45.58,46.17,62.29
