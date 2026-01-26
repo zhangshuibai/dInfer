@@ -9,7 +9,7 @@ evaluations/tasks/mbpp_sanitized/__pycache__/*
 ParallelBench/dataset/parallel_bench/data/__pycache__/*
 ParallelBench/dataset/parallel_bench/data/output/train/*
 # Analysis tables
-evaluations/analyze_remask_parallelbench/*.csv
+evaluations/analyze_remask_parallelbench/
 # Python cache
 __pycache__/
 *.py[cod]
