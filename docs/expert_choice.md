@@ -36,12 +36,6 @@ Note: please create a new branch for this work; do not modify `master`.
        into the format expected by `FusedMoE`.
    - Reason: expert-choice changes how tokens are grouped and fed to experts.
 
-4) **DeepEP (A2A) path**
-   - Update `forward_deepep()` and `DeepEPDispatcher` usage.
-   - With expert-choice, the dispatch should be expert->token centered, not
-     token->expert. The dispatcher API and its inputs will need to match the
-     new routing outputs.
-   - Reason: current dispatch assumes token-choice and will misroute tokens.
 
 ## Minimal code touch points
 - `python/dinfer/model/modeling_llada2_moe_sglang.py`

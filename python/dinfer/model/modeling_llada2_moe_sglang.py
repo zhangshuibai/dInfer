@@ -539,6 +539,23 @@ class LLaDA2SparseMoeBlock(nn.Module):
                 return_recv_hook=True,
             )
 
+        # Token distribution statistics
+        self.enable_token_stats = False
+        self.token_stats = {
+            'expert_token_count': torch.zeros(self.num_experts, dtype=torch.long),
+            'total_forwards': 0,
+            'total_tokens': 0,
+        }
+
+        # Incast statistics for cross-node communication analysis
+        self.enable_incast_stats = False
+        self.experts_per_node = 8  # Default: 8 experts per node
+        self.incast_stats = {
+            'per_forward_incast': [],  # List of dicts for each forward pass
+            'max_incast_degree': torch.zeros(self.num_experts, dtype=torch.long),
+            'total_remote_senders': torch.zeros(self.num_experts, dtype=torch.long),
+        }
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -568,6 +585,15 @@ class LLaDA2SparseMoeBlock(nn.Module):
         router_logits = self.gate(hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         # self._save_record(topk_output.topk_ids)
+
+        # Collect token distribution statistics
+        if self.enable_token_stats:
+            self._update_token_stats(topk_output.topk_ids, hidden_states.shape[0])
+
+        # Collect cross-node incast statistics
+        if self.enable_incast_stats:
+            self._update_incast_stats(topk_output.topk_ids)
+
         return self.experts(hidden_states, topk_output)
 
     @torch.compiler.disable
@@ -635,6 +661,14 @@ class LLaDA2SparseMoeBlock(nn.Module):
                     layer_id=self.layer_id,
                 ),
             )
+
+            # Collect token distribution statistics
+            if self.enable_token_stats:
+                self._update_token_stats(topk_idx, hidden_states.shape[0])
+
+            # Collect cross-node incast statistics
+            if self.enable_incast_stats:
+                self._update_incast_stats(topk_idx)
         else:
             topk_idx = torch.full(
                 (0, self.top_k), -1, dtype=torch.int, device=hidden_states.device
@@ -684,6 +718,318 @@ class LLaDA2SparseMoeBlock(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         return final_hidden_states
+
+    def enable_token_statistics(self):
+        """Enable token distribution statistics collection."""
+        self.enable_token_stats = True
+
+    def disable_token_statistics(self):
+        """Disable token distribution statistics collection."""
+        self.enable_token_stats = False
+
+    def _update_token_stats(self, topk_idx: torch.Tensor, num_tokens: int):
+        """Update token distribution statistics.
+
+        Args:
+            topk_idx: [num_tokens, top_k] tensor of selected expert indices
+            num_tokens: number of tokens in this batch
+        """
+        # Count how many times each expert is selected
+        # topk_idx shape: [num_tokens, top_k]
+        for expert_id in range(self.num_experts):
+            count = (topk_idx == expert_id).sum().item()
+            self.token_stats['expert_token_count'][expert_id] += count
+
+        self.token_stats['total_forwards'] += 1
+        self.token_stats['total_tokens'] += num_tokens
+
+        # Update incast statistics if enabled
+        if self.enable_incast_stats:
+            self._update_incast_stats(topk_idx)
+
+    def get_token_statistics(self):
+        """Get current token distribution statistics.
+
+        Returns:
+            dict: Statistics dictionary containing:
+                - expert_token_count: number of tokens received by each expert
+                - total_forwards: number of forward passes
+                - total_tokens: total number of tokens processed
+        """
+        return {
+            'expert_token_count': self.token_stats['expert_token_count'].cpu().numpy(),
+            'total_forwards': self.token_stats['total_forwards'],
+            'total_tokens': self.token_stats['total_tokens'],
+            'layer_id': self.layer_id,
+        }
+
+    def reset_token_statistics(self):
+        """Reset token distribution statistics."""
+        self.token_stats['expert_token_count'].zero_()
+        self.token_stats['total_forwards'] = 0
+        self.token_stats['total_tokens'] = 0
+
+    def print_token_statistics(self):
+        """Print token distribution statistics in a readable format."""
+        stats = self.get_token_statistics()
+        print(f"\n{'='*60}")
+        print(f"Layer {stats['layer_id']} - Token Distribution Statistics")
+        print(f"{'='*60}")
+        print(f"Total forward passes: {stats['total_forwards']}")
+        print(f"Total tokens processed: {stats['total_tokens']}")
+        print(f"\nTokens per expert:")
+        print(f"{'Expert ID':<12} {'Token Count':<15} {'Percentage':<12}")
+        print(f"{'-'*40}")
+
+        expert_counts = stats['expert_token_count']
+        total_selections = expert_counts.sum()
+
+        for expert_id in range(self.num_experts):
+            count = expert_counts[expert_id]
+            percentage = (count / total_selections * 100) if total_selections > 0 else 0
+            print(f"{expert_id:<12} {count:<15} {percentage:>6.2f}%")
+
+        print(f"\nTotal expert selections: {total_selections}")
+        print(f"Average tokens per expert: {total_selections / self.num_experts:.2f}")
+        print(f"{'='*60}\n")
+
+    def enable_incast_statistics(self, experts_per_node: int = 8):
+        """Enable incast statistics collection for cross-node communication analysis.
+
+        Args:
+            experts_per_node: Number of experts per node (default: 8)
+                             E.g., Node 0 has experts 0-7, Node 1 has experts 8-15, etc.
+        """
+        self.enable_incast_stats = True
+        self.experts_per_node = experts_per_node
+        self.incast_stats['per_forward_incast'] = []
+        self.incast_stats['max_incast_degree'].zero_()
+        self.incast_stats['total_remote_senders'].zero_()
+
+    def disable_incast_statistics(self):
+        """Disable incast statistics collection."""
+        self.enable_incast_stats = False
+
+    def _update_incast_stats(self, topk_idx: torch.Tensor):
+        """Update incast statistics for this forward pass.
+
+        This method analyzes cross-node communication patterns by checking,
+        for each expert, how many remote experts send tokens to it.
+
+        Args:
+            topk_idx: [num_tokens, top_k] tensor of selected expert indices
+                     Each row represents which experts a token routes to
+        """
+        # Skip during CUDA graph capture - operations like .any(), .unique() are not allowed
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+
+        # topk_idx shape: [num_tokens, top_k]
+        # Each token selects top_k experts
+
+        # For each expert (receiver), count how many unique remote experts send tokens to it
+        incast_this_forward = {}
+
+        for receiver_expert in range(self.num_experts):
+            receiver_node = receiver_expert // self.experts_per_node
+
+            # Find all tokens that route to this expert
+            token_mask = (topk_idx == receiver_expert).any(dim=1)
+            if not token_mask.any():
+                continue  # No tokens route to this expert
+
+            # Get the experts these tokens also route to (potential senders)
+            sender_experts = topk_idx[token_mask].unique()
+
+            # Filter to only remote experts (different node)
+            remote_senders = []
+            for sender in sender_experts.tolist():
+                sender_node = sender // self.experts_per_node
+                if sender_node != receiver_node:  # Cross-node communication
+                    remote_senders.append(sender)
+
+            num_remote_senders = len(remote_senders)
+            if num_remote_senders > 0:
+                incast_this_forward[receiver_expert] = {
+                    'num_remote_senders': num_remote_senders,
+                    'remote_sender_ids': remote_senders,
+                }
+
+                # Update max incast degree
+                if num_remote_senders > self.incast_stats['max_incast_degree'][receiver_expert]:
+                    self.incast_stats['max_incast_degree'][receiver_expert] = num_remote_senders
+
+                # Update total remote senders count
+                self.incast_stats['total_remote_senders'][receiver_expert] += num_remote_senders
+
+        # Store this forward pass's incast info
+        self.incast_stats['per_forward_incast'].append({
+            'forward_id': self.token_stats['total_forwards'],
+            'incast_data': incast_this_forward,
+        })
+
+    def get_incast_statistics(self):
+        """Get incast statistics.
+
+        Returns:
+            dict: Incast statistics including:
+                - per_forward_incast: List of per-forward-pass incast data
+                - max_incast_degree: Maximum incast degree for each expert
+                - total_remote_senders: Total number of remote senders across all forwards
+                - experts_per_node: Node configuration
+        """
+        return {
+            'per_forward_incast': self.incast_stats['per_forward_incast'],
+            'max_incast_degree': self.incast_stats['max_incast_degree'].cpu().numpy(),
+            'total_remote_senders': self.incast_stats['total_remote_senders'].cpu().numpy(),
+            'experts_per_node': self.experts_per_node,
+            'layer_id': self.layer_id,
+        }
+
+    def print_incast_statistics(self, top_n: int = 10, show_all_forwards: bool = False):
+        """Print incast statistics in a readable format.
+
+        Args:
+            top_n: Show top N experts with highest incast degree
+            show_all_forwards: If True, show details for each forward pass
+        """
+        stats = self.get_incast_statistics()
+
+        print(f"\n{'='*70}")
+        print(f"Layer {stats['layer_id']} - Cross-Node Incast Statistics")
+        print(f"{'='*70}")
+        print(f"Configuration: {self.experts_per_node} experts per node")
+        print(f"Total nodes: {self.num_experts // self.experts_per_node}")
+        print(f"Total forward passes analyzed: {len(stats['per_forward_incast'])}")
+
+        # Summary: Top experts by max incast degree
+        print(f"\n{'─'*70}")
+        print(f"Top {top_n} Experts with Highest Incast Degree (Network Hotspots)")
+        print(f"{'─'*70}")
+        print(f"{'Expert':<10} {'Node':<8} {'Max Incast':<15} {'Avg Incast':<15}")
+        print(f"{'-'*60}")
+
+        max_incast = stats['max_incast_degree']
+        total_remote = stats['total_remote_senders']
+        num_forwards = len(stats['per_forward_incast'])
+
+        # Get top N experts by max incast degree
+        top_experts = sorted(range(self.num_experts),
+                           key=lambda x: max_incast[x],
+                           reverse=True)[:top_n]
+
+        for expert_id in top_experts:
+            if max_incast[expert_id] == 0:
+                continue
+            node_id = expert_id // self.experts_per_node
+            avg_incast = total_remote[expert_id] / num_forwards if num_forwards > 0 else 0
+            print(f"{expert_id:<10} {node_id:<8} {max_incast[expert_id]:<15} {avg_incast:<15.2f}")
+
+        # Per-forward-pass details
+        if show_all_forwards and stats['per_forward_incast']:
+            print(f"\n{'─'*70}")
+            print(f"Per-Forward-Pass Incast Details")
+            print(f"{'─'*70}")
+
+            for forward_data in stats['per_forward_incast'][:10]:  # Show first 10 forwards
+                forward_id = forward_data['forward_id']
+                incast_data = forward_data['incast_data']
+
+                if not incast_data:
+                    continue
+
+                print(f"\nForward Pass #{forward_id}:")
+                for expert_id, data in sorted(incast_data.items())[:5]:  # Show top 5 per forward
+                    node_id = expert_id // self.experts_per_node
+                    num_senders = data['num_remote_senders']
+                    sender_ids = data['remote_sender_ids'][:5]  # Show first 5 senders
+                    print(f"  Expert {expert_id} (Node {node_id}): "
+                          f"{num_senders} remote senders {sender_ids}...")
+
+        print(f"{'='*70}\n")
+
+    def reset_incast_statistics(self):
+        """Reset incast statistics."""
+        self.incast_stats['per_forward_incast'] = []
+        self.incast_stats['max_incast_degree'].zero_()
+        self.incast_stats['total_remote_senders'].zero_()
+
+
+def print_aggregated_incast_statistics(moe_layers, experts_per_node=8):
+    """
+    Print aggregated incast statistics across all MoE layers.
+
+    Args:
+        moe_layers: List of tuples (layer_id, moe_layer)
+        experts_per_node: Number of experts per node for cross-node analysis
+    """
+    from collections import defaultdict
+
+    print(f"\n{'='*80}")
+    print("AGGREGATED INCAST ANALYSIS (ACROSS ALL LAYERS)")
+    print(f"{'='*80}")
+
+    all_incast_degrees = []
+    expert_max_incast = defaultdict(int)
+    expert_total_incast = defaultdict(int)
+    expert_appearances = defaultdict(int)
+
+    # Collect incast data from all layers
+    total_forwards = 0
+    for layer_id, moe_layer in moe_layers:
+        if not hasattr(moe_layer, 'get_incast_statistics'):
+            continue
+
+        incast_stats = moe_layer.get_incast_statistics()
+
+        # Process each forward pass
+        for forward_data in incast_stats['per_forward_incast']:
+            incast_data = forward_data['incast_data']
+            for expert_id, data in incast_data.items():
+                incast = data['num_remote_senders']
+                all_incast_degrees.append(incast)
+                expert_max_incast[expert_id] = max(expert_max_incast[expert_id], incast)
+                expert_total_incast[expert_id] += incast
+                expert_appearances[expert_id] += 1
+
+        total_forwards += len(incast_stats['per_forward_incast'])
+
+    if all_incast_degrees:
+        print(f"\nOverall Incast Statistics:")
+        print(f"  Total forward passes analyzed: {total_forwards}")
+        print(f"  Total layers: {len(moe_layers)}")
+        print(f"  Max incast degree: {max(all_incast_degrees)}")
+        print(f"  Min incast degree: {min(all_incast_degrees)}")
+        print(f"  Average incast degree: {sum(all_incast_degrees) / len(all_incast_degrees):.2f}")
+        print(f"  Median incast degree: {sorted(all_incast_degrees)[len(all_incast_degrees)//2]}")
+
+        # Top experts with highest max incast
+        print(f"\nTop 20 Experts with Highest Max Incast:\n")
+        print(f"{'Expert':<8} {'Node':<6} {'Max':<8} {'Avg':<8} {'Freq':<8}")
+        print(f"{'ID':<8} {'ID':<6} {'Incast':<8} {'Incast':<8} {'Count':<8}")
+        print(f"{'-'*50}")
+
+        expert_stats = []
+        for expert_id in expert_max_incast:
+            avg_incast = expert_total_incast[expert_id] / expert_appearances[expert_id]
+            expert_stats.append({
+                'id': expert_id,
+                'node': expert_id // experts_per_node,
+                'max': expert_max_incast[expert_id],
+                'avg': avg_incast,
+                'freq': expert_appearances[expert_id]
+            })
+
+        expert_stats.sort(key=lambda x: x['max'], reverse=True)
+
+        for stat in expert_stats[:20]:
+            print(f"{stat['id']:<8} {stat['node']:<6} {stat['max']:<8} "
+                  f"{stat['avg']:<8.1f} {stat['freq']:<8}")
+    else:
+        print("\nNo incast data collected. Make sure incast statistics are enabled.")
+
+    print(f"\n{'='*80}\n")
+
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:

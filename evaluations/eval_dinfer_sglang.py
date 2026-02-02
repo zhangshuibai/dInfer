@@ -90,6 +90,17 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
     initialize_moe_config(server_args)
 
     model = model.to(device)
+
+    # Enable incast statistics for all MoE layers
+    print("[Enabling incast statistics for MoE layers]")
+    moe_layers_for_incast = []
+    for i, layer in enumerate(model.model.layers):
+        if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'enable_incast_statistics'):
+            layer.mlp.enable_incast_statistics(experts_per_node=8)
+            layer.mlp.reset_incast_statistics()
+            moe_layers_for_incast.append((i, layer.mlp))
+    print(f"Enabled incast statistics for {len(moe_layers_for_incast)} MoE layers")
+
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     max_length = max(input_lengths)+args.gen_len
     model = ModelRunner(model, device, server_args=server_args, max_length=max_length)
@@ -230,6 +241,15 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
             answer = (tokenizer.decode(out[0, all_input_ids[i].shape[1]:], skip_special_tokens=True))
             answers.append(answer)
         print(f'Forward: {total_forward}, Time: {stop-start}, FPS: {total_forward/total_time}({np.mean(fpss)}), TPS: {total_token/total_time}({np.mean(tpss)}), TPF: {total_token/total_forward}({np.mean(tpfs)})')
+
+        # Print aggregated incast statistics
+        if len(moe_layers_for_incast) > 0:
+            print("\n" + "="*80)
+            print("CROSS-NODE INCAST STATISTICS")
+            print("="*80)
+            from dinfer.model.modeling_llada2_moe_sglang import print_aggregated_incast_statistics
+            print_aggregated_incast_statistics(moe_layers_for_incast, experts_per_node=8)
+
         filename = args.save_path
         with open (filename, 'w') as f:
             for i in range(len(answers)):

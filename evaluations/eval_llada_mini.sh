@@ -2,7 +2,7 @@
 export HF_ALLOW_CODE_EVAL=1
 export HF_DATASETS_TRUST_REMOTE_CODE=1
 export TRANSFORMERS_TRUST_REMOTE_CODE=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3
+export CUDA_VISIBLE_DEVICES=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -20,8 +20,8 @@ after_look=0
 cont_weight=0 # cont weight
 use_credit=False # enable credit for threshold mechanism
 use_compile=True # use compile
-tp_size=4 # tensor parallel size
-gpus='0;1;2;3' # gpus for tensor parallel inference
+tp_size=1 # tensor parallel size (changed to 1 GPU)
+gpus='0' # gpus for tensor parallel inference (changed to single GPU)
 parallel='tp' # 'tp' for tensor parallel or 'dp' for data parallel
 output_dir='./outputs' # your customer output path
 model_type='llada2' # llada2 (for llada2-mini) 
