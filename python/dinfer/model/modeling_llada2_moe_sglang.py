@@ -108,7 +108,8 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
-from sglang.srt.layers.moe.topk import TopK
+# Use our custom TopK implementation with expert-choice support
+from dinfer.model.topk_expert_choice import TopK
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -457,6 +458,16 @@ class LLaDA2SparseMoeBlock(nn.Module):
             self.num_expert_group = self.topk_group = None
             self.use_grouped_topk = False
 
+        # Expert-choice routing configuration
+        self.routing_strategy = getattr(config, "routing_strategy", "token_choice")
+        self.expert_capacity = getattr(config, "expert_capacity", None)
+        # Calculate default capacity if not specified
+        if self.routing_strategy == "expert_choice" and self.expert_capacity is None:
+            # Default capacity: (num_tokens * top_k) / num_experts
+            # This ensures same total compute as token-choice on average
+            self.expert_capacity = self.top_k  # Simple default: same as top_k
+        self.num_experts = config.num_experts
+
         self.num_experts = (
             config.num_experts 
         )
@@ -487,6 +498,10 @@ class LLaDA2SparseMoeBlock(nn.Module):
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
+            # Expert-choice routing parameters
+            routing_strategy=self.routing_strategy,
+            expert_capacity=self.expert_capacity,
+            num_experts=self.num_experts,
         )
 
         # self.experts = get_moe_impl_class(quant_config)(
