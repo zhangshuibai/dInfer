@@ -214,6 +214,20 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
 
         stop = time.time()
 
+        # Print inference time summary
+        if rank == 0:
+            total_inference_time = stop - start
+            print("\n" + "="*80)
+            print("INFERENCE TIME SUMMARY")
+            print("="*80)
+            print(f"Total inference time: {total_inference_time:.2f} seconds ({total_inference_time/60:.2f} minutes)")
+            print(f"Total samples processed: {len(sorted_input_ids)}")
+            print(f"Total tokens generated: {total_token}")
+            print(f"Total forward passes: {total_forward}")
+            print(f"Average time per sample: {total_inference_time/len(sorted_input_ids):.2f} seconds")
+            print(f"Average tokens per second (TPS): {total_token/total_inference_time:.2f}")
+            print(f"Average forwards per second (FPS): {total_forward/total_inference_time:.2f}")
+            print("="*80 + "\n")
 
     original_order_outputs = [None] * len(all_input_ids)
     original_order_tpfs = [None] * len(all_input_ids)

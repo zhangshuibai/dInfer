@@ -99,10 +99,6 @@ class TopKConfig:
     routed_scaling_factor: Optional[float] = None
     apply_routed_scaling_factor_on_output: bool = False
     output_format: Optional[TopKOutputFormat] = None
-    # Expert-choice routing parameters
-    routing_strategy: str = "token_choice"  # "token_choice" or "expert_choice"
-    expert_capacity: Optional[int] = None  # Capacity per expert for expert-choice
-    num_experts: Optional[int] = None  # Total number of experts
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -796,7 +792,7 @@ def expert_choice_topk_gpu(
     gating_output: torch.Tensor,
     capacity: int,
     num_experts: int,
-    top_k: int,
+    topk: int,
     renormalize: bool,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
@@ -804,12 +800,16 @@ def expert_choice_topk_gpu(
     """
     Expert-choice routing: Each expert selects top-capacity tokens.
 
+    Key difference from Token Choice:
+    - Token Choice: softmax row-wise (across experts for each token)
+    - Expert Choice: softmax column-wise (across tokens for each expert)
+
     Args:
         hidden_states: [N, hidden_dim]
         gating_output: [N, E] router logits
-        capacity: Maximum tokens per expert
+        capacity: Maximum tokens per expert (C)
         num_experts: Total number of experts (E)
-        top_k: Number of experts per token (for output format compatibility)
+        topk: Number of experts per token (for output format compatibility)
         renormalize: Whether to renormalize weights
 
     Returns:
@@ -820,61 +820,60 @@ def expert_choice_topk_gpu(
 
     num_tokens = gating_output.shape[0]
 
-    # Compute routing scores: softmax over tokens for each expert
+    # EXPERT CHOICE: Column-wise softmax (across tokens for each expert)
+    # P[t,e] = softmax_t(S[:,e]) - normalize over token dimension (dim=0)
+    scores = torch.softmax(gating_output, dim=0)  # [N, E] - softmax over tokens (dim=0)
+
     # Transpose to expert-centric view: [E, N]
-    scores = torch.softmax(gating_output, dim=-1)  # [N, E]
     scores_transposed = scores.t()  # [E, N]
 
     # Each expert selects top-capacity tokens
     # expert_topk_scores: [E, capacity]
     # expert_topk_token_ids: [E, capacity] - which tokens each expert selects
+    actual_capacity = min(capacity, num_tokens)
     expert_topk_scores, expert_topk_token_ids = torch.topk(
         scores_transposed,
-        k=min(capacity, num_tokens),
+        k=actual_capacity,
         dim=1,
         sorted=False
     )
 
-    # Now we need to convert back to token-centric format [N, K]
-    # Create a mapping: for each token, which experts selected it
+    # Convert back to token-centric format [N, K] using vectorized operations
+    # Create a sparse mapping: (expert_id, token_id) -> score
 
-    # Initialize output tensors
-    topk_weights = torch.zeros((num_tokens, top_k), dtype=torch.float32, device=gating_output.device)
-    topk_ids = torch.full((num_tokens, top_k), -1, dtype=torch.int32, device=gating_output.device)
+    # Flatten expert selections
+    expert_ids_flat = torch.arange(num_experts, device=gating_output.device).unsqueeze(1).expand(-1, actual_capacity).flatten()  # [E*C]
+    token_ids_flat = expert_topk_token_ids.flatten()  # [E*C]
+    scores_flat = expert_topk_scores.flatten()  # [E*C]
 
-    # For each token, collect which experts selected it
-    token_expert_lists = [[] for _ in range(num_tokens)]
-    token_weight_lists = [[] for _ in range(num_tokens)]
+    # Create a dense tensor to collect all (token, expert, score) tuples
+    # For each token, we'll have multiple experts that selected it
+    token_expert_scores = torch.full((num_tokens, num_experts), -float('inf'), device=gating_output.device)
+    # Use index_put_ instead of fancy indexing for CUDA graph compatibility
+    token_expert_scores.index_put_((token_ids_flat, expert_ids_flat), scores_flat)
 
-    for expert_id in range(num_experts):
-        selected_tokens = expert_topk_token_ids[expert_id]
-        selected_weights = expert_topk_scores[expert_id]
+    # For each token, select top-k experts that selected it (highest scores)
+    topk_weights, topk_ids = torch.topk(
+        token_expert_scores,
+        k=topk,
+        dim=1,
+        sorted=False
+    )
 
-        for i in range(selected_tokens.shape[0]):
-            token_id = selected_tokens[i].item()
-            weight = selected_weights[i].item()
-
-            if len(token_expert_lists[token_id]) < top_k:
-                token_expert_lists[token_id].append(expert_id)
-                token_weight_lists[token_id].append(weight)
-
-    # Fill in the output tensors
-    for token_id in range(num_tokens):
-        experts = token_expert_lists[token_id]
-        weights = token_weight_lists[token_id]
-
-        for i, (expert_id, weight) in enumerate(zip(experts, weights)):
-            if i < top_k:
-                topk_ids[token_id, i] = expert_id
-                topk_weights[token_id, i] = weight
+    # Replace -inf with 0 for weights, and set invalid expert IDs to -1
+    invalid_mask = torch.isinf(topk_weights)
+    topk_weights = torch.where(invalid_mask, torch.zeros_like(topk_weights), topk_weights)
+    topk_ids = torch.where(invalid_mask, torch.full_like(topk_ids, -1), topk_ids)
 
     # Renormalize weights per token
     if renormalize:
-        # Only renormalize where we have valid experts (topk_ids >= 0)
         valid_mask = topk_ids >= 0
         weights_sum = topk_weights.sum(dim=-1, keepdim=True)
         weights_sum = torch.where(weights_sum > 0, weights_sum, torch.ones_like(weights_sum))
         topk_weights = torch.where(valid_mask, topk_weights / weights_sum, topk_weights)
+
+    topk_weights = topk_weights.to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
 
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
@@ -887,7 +886,7 @@ def expert_choice_topk_cpu(
     gating_output: torch.Tensor,
     capacity: int,
     num_experts: int,
-    top_k: int,
+    topk: int,
     renormalize: bool,
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
@@ -899,11 +898,147 @@ def expert_choice_topk_cpu(
         gating_output,
         capacity,
         num_experts,
-        top_k,
+        topk,
         renormalize,
         num_token_non_padded,
         expert_location_dispatch_info,
     )
+
+
+@torch.compile(dynamic=True, backend=get_compiler_backend())
+def grouped_expert_choice_topk_gpu(
+    hidden_states: torch.Tensor,
+    gating_output: torch.Tensor,
+    capacity: int,
+    num_experts: int,
+    topk: int,
+    renormalize: bool,
+    num_expert_group: int,
+    topk_group: int,
+    capacity_per_group: Optional[int] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
+):
+    """
+    Grouped Expert-choice routing with proper group boundary handling.
+
+    Key difference from Token Choice:
+    - Token Choice: tokens select experts (row-wise softmax)
+    - Expert Choice: experts select tokens (column-wise softmax)
+
+    Grouped structure:
+    1. Each expert selects top-capacity tokens (expert choice)
+    2. Tokens first select top-k_group groups based on max scores
+    3. Within selected groups, tokens select top-k experts
+
+    Args:
+        hidden_states: [N, hidden_dim]
+        gating_output: [N, E] router logits
+        capacity: Capacity per expert
+        num_experts: Total number of experts (E)
+        topk: Number of experts per token (for output format)
+        renormalize: Whether to renormalize weights
+        num_expert_group: Number of expert groups (G)
+        topk_group: Number of groups to select per token
+        capacity_per_group: Tokens per group (unused in expert choice)
+
+    Returns:
+        topk_weights: [N, K] - weights for selected experts per token
+        topk_ids: [N, K] - expert IDs selected for each token
+    """
+    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+
+    num_tokens = gating_output.shape[0]
+    experts_per_group = num_experts // num_expert_group
+
+    # Step 1: EXPERT CHOICE - Column-wise softmax (each expert competes for tokens)
+    scores = torch.softmax(gating_output, dim=0)  # [N, E] - normalize over tokens (dim=0)
+
+    # Transpose to expert-centric view [E, N]
+    scores_expert_view = scores.t()  # [E, N]
+
+    # Step 2: Each expert selects its top-capacity tokens (vectorized)
+    actual_capacity = min(capacity, num_tokens)
+
+    # All experts select their top-capacity tokens in parallel
+    _, expert_topk_token_ids = torch.topk(
+        scores_expert_view,  # [E, N]
+        k=actual_capacity,
+        dim=1,  # topk along token dimension
+        sorted=False
+    )  # Returns: [E, capacity]
+
+    # Create mask [E, N] where mask[e, t] = 1 if expert e selected token t
+    expert_token_mask = torch.zeros(num_experts, num_tokens, device=gating_output.device)  # [E, N]
+
+    # Use scatter to mark selected tokens (vectorized over experts)
+    expert_ids = torch.arange(num_experts, device=gating_output.device).unsqueeze(1).expand(-1, actual_capacity)  # [E, capacity]
+    expert_ids_flat = expert_ids.flatten()
+    token_ids_flat = expert_topk_token_ids.flatten()
+
+    # Scatter into mask
+    expert_token_mask.view(-1).scatter_(
+        0,
+        expert_ids_flat * num_tokens + token_ids_flat,  # Linear index
+        1.0
+    )
+
+    # Step 3: Convert to token-centric view and apply expert choice mask
+    token_expert_mask = expert_token_mask.t()  # [N, E]
+
+    # Use -inf for masked positions (where expert didn't select token)
+    # This ensures they won't be selected by topk
+    filtered_scores = torch.where(
+        token_expert_mask > 0,
+        scores,
+        torch.full_like(scores, -float('inf'))
+    )  # [N, E]
+
+    # Step 4: GROUPED SELECTION - Reshape to group structure [N, G, E/G]
+    filtered_scores_grouped = filtered_scores.view(num_tokens, num_expert_group, experts_per_group)  # [N, G, E/G]
+
+    # For each token, find max score in each group (handle -inf properly)
+    group_max_scores, _ = filtered_scores_grouped.max(dim=2)  # [N, G]
+
+    # Select top-k_group groups per token (groups with -inf will have lowest priority)
+    _, selected_group_ids = torch.topk(group_max_scores, k=topk_group, dim=1, sorted=False)  # [N, topk_group]
+
+    # Step 5: Create group mask [N, G] - mark selected groups
+    group_mask = torch.zeros(num_tokens, num_expert_group, device=gating_output.device, dtype=torch.bool)  # [N, G]
+    group_mask.scatter_(1, selected_group_ids, True)  # [N, G]
+
+    # Expand group mask to expert level [N, E]
+    expert_group_mask = group_mask.unsqueeze(2).expand(-1, -1, experts_per_group).reshape(num_tokens, num_experts)  # [N, E]
+
+    # Apply group mask to filtered scores (set non-selected groups to -inf)
+    final_scores = torch.where(
+        expert_group_mask,
+        filtered_scores,
+        torch.full_like(filtered_scores, -float('inf'))
+    )  # [N, E]
+
+    # Step 6: Each token selects top-k experts from selected groups
+    topk_weights, topk_ids = torch.topk(final_scores, k=topk, dim=-1, sorted=False)  # [N, K]
+
+    # Replace -inf weights with 0 and invalid expert IDs with -1
+    invalid_mask = torch.isinf(topk_weights)
+    topk_weights = torch.where(invalid_mask, torch.zeros_like(topk_weights), topk_weights)
+    topk_ids = torch.where(invalid_mask, torch.full_like(topk_ids, -1), topk_ids)
+
+    # Step 7: Renormalize weights (only valid ones)
+    if renormalize:
+        valid_mask = topk_ids >= 0
+        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights_sum = torch.where(topk_weights_sum > 0, topk_weights_sum, torch.ones_like(topk_weights_sum))
+        topk_weights = torch.where(valid_mask, topk_weights / topk_weights_sum, topk_weights)
+
+    topk_weights = topk_weights.to(torch.float32)
+    topk_ids = topk_ids.to(torch.int32)
+
+    topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+
+    return topk_weights, topk_ids
 
 
 if _is_cpu and _is_cpu_amx_available:
@@ -934,9 +1069,6 @@ def select_experts(
     apply_routed_scaling_factor_on_output = (
         topk_config.apply_routed_scaling_factor_on_output
     )
-    routing_strategy = topk_config.routing_strategy
-    expert_capacity = topk_config.expert_capacity
-    num_experts = topk_config.num_experts
 
     router_logits, correction_bias = (
         expert_location_dispatch.transform_select_experts_inputs(
@@ -946,25 +1078,22 @@ def select_experts(
         )
     )
 
-    # Expert-choice routing
-    if routing_strategy == "expert_choice":
-        assert expert_capacity is not None, "expert_capacity must be set for expert_choice routing"
-        assert num_experts is not None, "num_experts must be set for expert_choice routing"
-        topk_weights, topk_ids = expert_choice_topk(
-            hidden_states=hidden_states,
-            gating_output=router_logits,
-            capacity=expert_capacity,
-            num_experts=num_experts,
-            top_k=top_k,
-            renormalize=renormalize,
-            num_token_non_padded=num_token_non_padded,
-            expert_location_dispatch_info=expert_location_dispatch_info,
-        )
     # DeepSeek V2/V3/R1 series models use grouped_top_k
-    elif use_grouped_topk:
+    if use_grouped_topk:
         assert topk_group is not None
         assert num_expert_group is not None
-        if correction_bias is None:
+        # Check if custom routing function is provided first
+        if custom_routing_function is not None:
+            # Use custom routing function (e.g., Expert Choice)
+            topk_weights, topk_ids = custom_routing_function(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+        elif correction_bias is None:
             topk_weights, topk_ids = grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
