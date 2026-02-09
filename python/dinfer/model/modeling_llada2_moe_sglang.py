@@ -33,6 +33,13 @@ import re
 from safetensors.torch import load_file
 import torch.distributed as dist
 
+# Expert Choice routing
+from dinfer.model.fused_moe_ec import (
+    expert_choice_routing,
+    expert_choice_fused_experts,
+    ExpertChoiceRoutingOutput,
+)
+
 import sglang.srt.distributed as sglang_distributed
 import traceback
 def torch_all_reduce(tensor):
@@ -108,9 +115,8 @@ from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
-# Use our TopK implementation with Expert Choice support
-from dinfer.model.topk_expert_choice import TopK, expert_choice_topk_gpu, grouped_expert_choice_topk_gpu
-from sglang.srt.layers.moe.utils import DeepEPMode
+# TopK for token choice routing
+from dinfer.model.topk_expert_choice import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -467,6 +473,11 @@ class LLaDA2SparseMoeBlock(nn.Module):
             # This ensures same total compute as token-choice on average
             self.expert_capacity = self.top_k  # Simple default: same as top_k
         self.num_experts = config.num_experts
+        self._ec_debug_counter = 0  # Counter for debug prints
+
+        # Print routing strategy on initialization
+        if self.routing_strategy == "expert_choice":
+            print(f"[MoE Layer Init] Expert Choice routing enabled (num_experts={self.num_experts}, C = n*{self.top_k}/{self.num_experts})")
 
         self.num_experts = (
             config.num_experts 
@@ -489,37 +500,15 @@ class LLaDA2SparseMoeBlock(nn.Module):
                 self.score_function == "sigmoid" and self.correction_bias is not None
             ), "score_function and correction_bias should be in 2 combination (softmax, None) or (sigmoid, not None)"
 
-        # Determine custom routing function based on strategy
-        from functools import partial
-        custom_routing_fn = None
-        if self.routing_strategy == "expert_choice":
-            if self.use_grouped_topk:
-                # Use grouped expert choice for hierarchical routing
-                custom_routing_fn = partial(
-                    grouped_expert_choice_topk_gpu,
-                    capacity=self.expert_capacity,
-                    num_experts=self.num_experts,
-                    num_expert_group=self.num_expert_group,
-                    topk_group=self.topk_group,
-                )
-            else:
-                # Use standard expert choice (non-grouped)
-                custom_routing_fn = partial(
-                    expert_choice_topk_gpu,
-                    capacity=self.expert_capacity,
-                    num_experts=self.num_experts,
-                )
-
+        # Standard token choice routing
         self.topk = TopK(
             top_k=self.top_k,
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
-            # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            custom_routing_function=custom_routing_fn,
         )
 
         # self.experts = get_moe_impl_class(quant_config)(
@@ -534,6 +523,7 @@ class LLaDA2SparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             inplace=False,
         )
+
         # shared expert
         if config.num_shared_experts is not None:
             if hasattr(config, "moe_shared_expert_intermediate_size"):
@@ -589,6 +579,20 @@ class LLaDA2SparseMoeBlock(nn.Module):
             'total_remote_senders': torch.zeros(self.num_experts, dtype=torch.long),
         }
 
+        # Expert co-selection matrix statistics
+        # Records 256x256 matrix for each forward pass showing token sharing between experts
+        # matrix[i][j] = number of tokens selected by both expert i and expert j
+        self.enable_coselection_stats = False
+        self.coselection_matrices = []  # List of 256x256 matrices, one per forward
+
+        # Physical communication matrix statistics
+        # Records [num_gpus, num_gpus] matrix for each forward pass
+        # comm_matrix[i][j] = number of tokens GPU i sends to GPU j in all2all
+        self.enable_communication_stats = False
+        self.communication_matrices = []  # List of [num_gpus, num_gpus] matrices
+        self.num_gpus = 32  # Default: 256 experts / 8 experts_per_gpu = 32 GPUs
+        self.tokens_per_gpu = None  # Will be set based on batch size
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -616,18 +620,148 @@ class LLaDA2SparseMoeBlock(nn.Module):
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
-        # self._save_record(topk_output.topk_ids)
 
-        # Collect token distribution statistics
-        if self.enable_token_stats:
-            self._update_token_stats(topk_output.topk_ids, hidden_states.shape[0])
+        if self.routing_strategy == "expert_choice":
+            # Expert Choice routing: each expert selects its top-C tokens
+            # Capacity is calculated dynamically: C = n * top_k / num_experts
+            # This ensures same total compute as token-choice
+            num_tokens = hidden_states.shape[0]
+            # Always calculate capacity dynamically based on block size
+            # C = n * top_k / E ensures total selections = n * top_k (same as token choice)
+            capacity = max(1, (num_tokens * self.top_k) // self.num_experts)
 
-        # Collect cross-node incast statistics
-        if self.enable_incast_stats:
-            self._update_incast_stats(topk_output.topk_ids)
+            # Debug print for first few calls
+            if self._ec_debug_counter < 2:
+                print(f"[Expert Choice] n={num_tokens}, C={capacity}")
+                self._ec_debug_counter += 1
 
-        return self.experts(hidden_states, topk_output)
+            # Get expert choice routing output in native [E, C] format
+            routing_output = expert_choice_routing(
+                gating_output=router_logits,
+                capacity=capacity,
+                renormalize=self.norm_topk_prob,
+            )
+
+            # Note: Statistics collection is skipped for Expert Choice mode
+            # because expert_tokens contains token indices [0, N), not expert indices [0, E)
+            # The existing stats functions expect [N, K] with expert indices
+
+            # Use expert choice fused experts with native [E, C] format
+            # Auto-detect weight format based on shape
+            # Triton format: w1=[E, H, 2*I], Standard format: w1=[E, 2*I, H]
+            # If w1.shape[1] > w1.shape[2], it's triton format (H > 2*I is typical)
+            # If w1.shape[1] < w1.shape[2], it's standard format (2*I < H is typical)
+            w1 = self.experts.w13_weight
+            w2 = self.experts.w2_weight
+            hidden_dim = hidden_states.shape[-1]
+            # Check if w1's dim1 == hidden_dim (triton format) or dim2 == hidden_dim (standard)
+            use_triton_format = (w1.shape[1] == hidden_dim)
+
+            return expert_choice_fused_experts(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                routing_output=routing_output,
+                activation="silu",
+                use_triton_weight_format=use_triton_format,
+            )
+        else:
+            # Standard Token Choice routing
+            topk_output = self.topk(hidden_states, router_logits)
+
+            # Collect statistics
+            if self.enable_token_stats:
+                self._update_token_stats(topk_output.topk_ids, hidden_states.shape[0])
+            if self.enable_incast_stats:
+                self._update_incast_stats(topk_output.topk_ids)
+            if self.enable_coselection_stats:
+                self._update_coselection_stats(topk_output.topk_ids)
+            if self.enable_communication_stats:
+                self._update_communication_stats(topk_output.topk_ids)
+
+            return self.experts(hidden_states, topk_output)
+
+    def _update_coselection_stats(self, topk_ids: torch.Tensor):
+        """
+        Compute expert co-selection matrix for this forward pass.
+
+        For token choice: matrix[i][j] = number of tokens that selected BOTH expert i and expert j
+        (i.e., tokens where both experts appear in the top-k selection)
+
+        For expert choice: matrix[i][j] = number of tokens selected by BOTH expert i and expert j
+
+        Args:
+            topk_ids: [N, K] tensor of expert IDs per token, -1 for invalid
+        """
+        # Skip during CUDA graph capture - dynamic operations not allowed
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+
+        num_tokens = topk_ids.shape[0]
+
+        # Build binary assignment matrix [N, E] where assignment[t, e] = 1 if expert e selected token t
+        assignment = torch.zeros(num_tokens, self.num_experts, dtype=torch.int32, device=topk_ids.device)
+
+        # For each token, mark which experts selected it
+        for k in range(topk_ids.shape[1]):
+            expert_ids = topk_ids[:, k]
+            valid_mask = expert_ids >= 0
+            valid_tokens = torch.arange(num_tokens, device=topk_ids.device)[valid_mask]
+            valid_experts = expert_ids[valid_mask]
+            assignment[valid_tokens, valid_experts] = 1
+
+        # Compute co-selection matrix: C = A^T @ A
+        # C[i,j] = number of tokens selected by both expert i and expert j
+        coselection = torch.mm(assignment.t().float(), assignment.float())
+
+        # Store as CPU numpy array to save GPU memory
+        self.coselection_matrices.append(coselection.cpu().numpy())
+
+    def _update_communication_stats(self, topk_ids: torch.Tensor):
+        """
+        Compute physical GPU-to-GPU communication matrix for this forward pass.
+
+        Simulates the all2all communication pattern:
+        - Assumes tokens are distributed evenly across num_gpus GPUs
+        - Assumes experts are distributed evenly (experts_per_node per GPU)
+        - comm_matrix[i][j] = number of tokens GPU i sends to GPU j
+
+        Args:
+            topk_ids: [N, K] tensor of expert IDs per token, -1 for invalid
+        """
+        # Skip during CUDA graph capture
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+
+        num_tokens = topk_ids.shape[0]
+        num_gpus = self.num_gpus
+        experts_per_gpu = self.num_experts // num_gpus  # e.g., 256/32 = 8
+
+        # Initialize communication matrix [num_gpus, num_gpus]
+        comm_matrix = torch.zeros(num_gpus, num_gpus, dtype=torch.int64, device=topk_ids.device)
+
+        # Compute source GPU for each token (assuming even distribution)
+        # Token i is on GPU (i * num_gpus) // num_tokens
+        token_src_gpu = (torch.arange(num_tokens, device=topk_ids.device) * num_gpus) // num_tokens
+
+        # For each top-k selection
+        for k in range(topk_ids.shape[1]):
+            expert_ids = topk_ids[:, k]  # [N]
+            valid_mask = expert_ids >= 0
+
+            # Destination GPU for each token (based on selected expert)
+            # Expert e is on GPU e // experts_per_gpu
+            dst_gpu = expert_ids[valid_mask] // experts_per_gpu  # [valid_N]
+            src_gpu = token_src_gpu[valid_mask]  # [valid_N]
+
+            # Count communications: for each (src, dst) pair, increment count
+            # Use scatter_add for efficiency
+            flat_idx = src_gpu * num_gpus + dst_gpu
+            ones = torch.ones_like(flat_idx, dtype=torch.int64)
+            comm_matrix.view(-1).scatter_add_(0, flat_idx, ones)
+
+        # Store as CPU numpy array
+        self.communication_matrices.append(comm_matrix.cpu().numpy())
 
     @torch.compiler.disable
     def forward_normal_dual_stream(
@@ -860,15 +994,25 @@ class LLaDA2SparseMoeBlock(nn.Module):
         # topk_idx shape: [num_tokens, top_k]
         # Each token selects top_k experts
 
-        # For each expert (receiver), count how many unique remote experts send tokens to it
+        # For each expert, count tokens and incast degree
         incast_this_forward = {}
+
+        # Count tokens per expert for this forward pass
+        expert_token_counts = {}
+        valid_experts = topk_idx[topk_idx >= 0]  # Filter out -1 (invalid)
+        if valid_experts.numel() > 0:
+            unique_experts, counts = torch.unique(valid_experts, return_counts=True)
+            for expert_id, count in zip(unique_experts.tolist(), counts.tolist()):
+                expert_token_counts[expert_id] = count
 
         for receiver_expert in range(self.num_experts):
             receiver_node = receiver_expert // self.experts_per_node
 
             # Find all tokens that route to this expert
             token_mask = (topk_idx == receiver_expert).any(dim=1)
-            if not token_mask.any():
+            num_tokens = token_mask.sum().item()
+
+            if num_tokens == 0:
                 continue  # No tokens route to this expert
 
             # Get the experts these tokens also route to (potential senders)
@@ -877,28 +1021,33 @@ class LLaDA2SparseMoeBlock(nn.Module):
             # Filter to only remote experts (different node)
             remote_senders = []
             for sender in sender_experts.tolist():
+                if sender < 0:  # Skip invalid expert IDs
+                    continue
                 sender_node = sender // self.experts_per_node
                 if sender_node != receiver_node:  # Cross-node communication
                     remote_senders.append(sender)
 
             num_remote_senders = len(remote_senders)
-            if num_remote_senders > 0:
-                incast_this_forward[receiver_expert] = {
-                    'num_remote_senders': num_remote_senders,
-                    'remote_sender_ids': remote_senders,
-                }
 
-                # Update max incast degree
-                if num_remote_senders > self.incast_stats['max_incast_degree'][receiver_expert]:
-                    self.incast_stats['max_incast_degree'][receiver_expert] = num_remote_senders
+            # Store both token count and incast info for this expert
+            incast_this_forward[receiver_expert] = {
+                'num_tokens': num_tokens,
+                'num_remote_senders': num_remote_senders,
+                'remote_sender_ids': remote_senders if num_remote_senders > 0 else [],
+            }
 
-                # Update total remote senders count
-                self.incast_stats['total_remote_senders'][receiver_expert] += num_remote_senders
+            # Update max incast degree
+            if num_remote_senders > self.incast_stats['max_incast_degree'][receiver_expert]:
+                self.incast_stats['max_incast_degree'][receiver_expert] = num_remote_senders
 
-        # Store this forward pass's incast info
+            # Update total remote senders count
+            self.incast_stats['total_remote_senders'][receiver_expert] += num_remote_senders
+
+        # Store this forward pass's incast info with full expert token distribution
         self.incast_stats['per_forward_incast'].append({
             'forward_id': self.token_stats['total_forwards'],
             'incast_data': incast_this_forward,
+            'expert_token_distribution': expert_token_counts,  # All experts' token counts this forward
         })
 
     def get_incast_statistics(self):
@@ -987,16 +1136,443 @@ class LLaDA2SparseMoeBlock(nn.Module):
         self.incast_stats['max_incast_degree'].zero_()
         self.incast_stats['total_remote_senders'].zero_()
 
+    # -------------------- Co-selection Matrix Statistics --------------------
 
-def print_aggregated_incast_statistics(moe_layers, experts_per_node=8):
+    def enable_coselection_statistics(self):
+        """Enable expert co-selection matrix collection."""
+        self.enable_coselection_stats = True
+        self.coselection_matrices = []
+
+    def disable_coselection_statistics(self):
+        """Disable expert co-selection matrix collection."""
+        self.enable_coselection_stats = False
+
+    def reset_coselection_statistics(self):
+        """Reset co-selection matrices."""
+        self.coselection_matrices = []
+
+    def get_coselection_matrices(self):
+        """Get all co-selection matrices collected.
+
+        Returns:
+            List of numpy arrays, each [num_experts, num_experts]
+            matrix[i][j] = number of tokens selected by both expert i and expert j
+        """
+        return self.coselection_matrices
+
+    # -------------------- Physical Communication Matrix Statistics --------------------
+
+    def enable_communication_statistics(self, num_gpus: int = 32, experts_per_gpu: int = 8):
+        """Enable physical GPU-to-GPU communication matrix collection.
+
+        Args:
+            num_gpus: Number of GPUs in the cluster (default: 32)
+            experts_per_gpu: Number of experts per GPU (default: 8)
+        """
+        self.enable_communication_stats = True
+        self.communication_matrices = []
+        self.num_gpus = num_gpus
+        # Verify consistency
+        assert self.num_experts == num_gpus * experts_per_gpu, \
+            f"num_experts ({self.num_experts}) != num_gpus ({num_gpus}) * experts_per_gpu ({experts_per_gpu})"
+
+    def disable_communication_statistics(self):
+        """Disable physical communication matrix collection."""
+        self.enable_communication_stats = False
+
+    def reset_communication_statistics(self):
+        """Reset communication matrices."""
+        self.communication_matrices = []
+
+    def get_communication_matrices(self):
+        """Get all physical communication matrices collected.
+
+        Returns:
+            List of numpy arrays, each [num_gpus, num_gpus]
+            matrix[i][j] = number of tokens GPU i sends to GPU j in all2all
+        """
+        return self.communication_matrices
+
+
+def save_communication_matrices(moe_layers, output_dir: str):
+    """
+    Save all physical communication matrices from all MoE layers to files.
+
+    Saves two files:
+        - dispatch_matrices.npz: tokens sent from GPU i to GPU j (token on i, expert on j)
+        - combine_matrices.npz: results sent from GPU i to GPU j (expert on i, token on j)
+        Note: combine = dispatch.T
+
+    Output format (npz file):
+        - layer_{i}_forward_{j}: [num_gpus, num_gpus] matrix for layer i, forward pass j
+
+    Args:
+        moe_layers: List of MoE layer modules
+        output_dir: Output directory path
+    """
+    import numpy as np
+    import os
+
+    dispatch_data = {}
+    combine_data = {}
+    metadata = {
+        'num_layers': len(moe_layers),
+        'num_gpus': moe_layers[0].num_gpus if moe_layers else 0,
+        'num_experts': moe_layers[0].num_experts if moe_layers else 0,
+    }
+
+    for layer_idx, layer in enumerate(moe_layers):
+        matrices = layer.get_communication_matrices()
+        metadata[f'layer_{layer_idx}_num_forwards'] = len(matrices)
+
+        for forward_idx, matrix in enumerate(matrices):
+            key = f'layer_{layer_idx}_forward_{forward_idx}'
+            dispatch_data[key] = matrix
+            combine_data[key] = matrix.T  # Combine is transpose of dispatch
+
+    # Save dispatch matrices
+    dispatch_file = os.path.join(output_dir, 'dispatch_matrices.npz')
+    np.savez_compressed(dispatch_file, **dispatch_data, metadata=np.array([str(metadata)]))
+
+    # Save combine matrices
+    combine_file = os.path.join(output_dir, 'combine_matrices.npz')
+    np.savez_compressed(combine_file, **combine_data, metadata=np.array([str(metadata)]))
+
+    total_matrices = sum(len(l.get_communication_matrices()) for l in moe_layers)
+    print(f"Saved {total_matrices} dispatch matrices to {dispatch_file}")
+    print(f"Saved {total_matrices} combine matrices to {combine_file}")
+
+
+def enable_all_communication_statistics(moe_layers, num_gpus: int = 32, experts_per_gpu: int = 8):
+    """Enable communication statistics for all MoE layers."""
+    for layer in moe_layers:
+        layer.enable_communication_statistics(num_gpus, experts_per_gpu)
+    print(f"Enabled communication statistics for {len(moe_layers)} MoE layers (num_gpus={num_gpus})")
+
+
+def disable_all_communication_statistics(moe_layers):
+    """Disable communication statistics for all MoE layers."""
+    for layer in moe_layers:
+        layer.disable_communication_statistics()
+
+
+def reset_all_communication_statistics(moe_layers):
+    """Reset communication statistics for all MoE layers."""
+    for layer in moe_layers:
+        layer.reset_communication_statistics()
+
+
+def save_coselection_matrices(moe_layers, output_file: str):
+    """
+    Save all co-selection matrices from all MoE layers to a file.
+
+    Output format (npz file):
+        - layer_{i}_forward_{j}: 256x256 matrix for layer i, forward pass j
+
+    Args:
+        moe_layers: List of MoE layer modules
+        output_file: Output file path (will be saved as .npz)
+    """
+    import numpy as np
+
+    data = {}
+    metadata = {
+        'num_layers': len(moe_layers),
+        'num_experts': moe_layers[0].num_experts if moe_layers else 0,
+    }
+
+    for layer_idx, layer in enumerate(moe_layers):
+        matrices = layer.get_coselection_matrices()
+        metadata[f'layer_{layer_idx}_num_forwards'] = len(matrices)
+
+        for forward_idx, matrix in enumerate(matrices):
+            key = f'layer_{layer_idx}_forward_{forward_idx}'
+            data[key] = matrix
+
+    # Save as compressed npz
+    np.savez_compressed(output_file, **data, metadata=np.array([str(metadata)]))
+    print(f"Saved {sum(len(l.get_coselection_matrices()) for l in moe_layers)} co-selection matrices to {output_file}")
+
+
+def enable_all_coselection_statistics(moe_layers):
+    """Enable co-selection statistics for all MoE layers."""
+    for layer in moe_layers:
+        layer.enable_coselection_statistics()
+    print(f"Enabled co-selection statistics for {len(moe_layers)} MoE layers")
+
+
+def disable_all_coselection_statistics(moe_layers):
+    """Disable co-selection statistics for all MoE layers."""
+    for layer in moe_layers:
+        layer.disable_coselection_statistics()
+
+
+def reset_all_coselection_statistics(moe_layers):
+    """Reset co-selection statistics for all MoE layers."""
+    for layer in moe_layers:
+        layer.reset_coselection_statistics()
+
+
+def print_aggregated_incast_statistics(moe_layers, experts_per_node=8, output_file=None):
     """
     Print aggregated incast statistics across all MoE layers.
 
     Args:
         moe_layers: List of tuples (layer_id, moe_layer)
         experts_per_node: Number of experts per node for cross-node analysis
+        output_file: Optional path to write detailed statistics to file
     """
     from collections import defaultdict
+    import numpy as np
+    import json
+
+    # Collect detailed per-layer, per-expert statistics
+    detailed_stats = {
+        'layers': {},
+        'summary': {}
+    }
+
+    # First, collect detailed per-layer, per-expert statistics
+    print(f"\n{'='*80}")
+    print("PER-LAYER EXPERT LOAD ANALYSIS (CUMULATIVE)")
+    print(f"{'='*80}")
+
+    all_layer_stats = []
+
+    # Iterate over layers and collect both token stats and incast stats
+    print(f"Processing {len(moe_layers)} MoE layers for detailed statistics...")
+    for layer_id, moe_layer in moe_layers:
+        if not hasattr(moe_layer, 'get_token_statistics'):
+            print(f"  Warning: Layer {layer_id} does not have get_token_statistics method")
+            continue
+
+        print(f"  Processing layer {layer_id}...")
+        # Get cumulative token statistics for this layer
+        token_stats = moe_layer.get_token_statistics()
+        expert_counts = token_stats['expert_token_count']  # numpy array
+        total_forwards = token_stats['total_forwards']
+        total_tokens = token_stats['total_tokens']
+
+        # Get incast statistics for this layer
+        incast_stats = moe_layer.get_incast_statistics() if hasattr(moe_layer, 'get_incast_statistics') else None
+
+        if total_forwards > 0:
+            # Calculate per-forward-pass average
+            avg_tokens_per_forward = total_tokens / total_forwards
+            max_tokens = expert_counts.max()
+            min_tokens = expert_counts.min()
+            avg_tokens = expert_counts.mean()
+            median_tokens = np.median(expert_counts)
+            experts_used = (expert_counts > 0).sum()
+
+            # Collect per-expert incast degrees
+            expert_incast_degrees = {}
+            if incast_stats:
+                expert_max_incast_layer = defaultdict(int)
+                expert_total_incast_layer = defaultdict(int)
+                expert_appearances_layer = defaultdict(int)
+
+                for forward_data in incast_stats['per_forward_incast']:
+                    incast_data = forward_data['incast_data']
+                    for expert_id, data in incast_data.items():
+                        incast = data['num_remote_senders']
+                        expert_max_incast_layer[expert_id] = max(expert_max_incast_layer[expert_id], incast)
+                        expert_total_incast_layer[expert_id] += incast
+                        expert_appearances_layer[expert_id] += 1
+
+                # Calculate average incast per expert
+                for expert_id in expert_max_incast_layer:
+                    avg_incast = expert_total_incast_layer[expert_id] / expert_appearances_layer[expert_id]
+                    expert_incast_degrees[expert_id] = {
+                        'max_incast': int(expert_max_incast_layer[expert_id]),
+                        'avg_incast': float(avg_incast),
+                        'appearances': int(expert_appearances_layer[expert_id])
+                    }
+
+            # Build detailed per-expert data for this layer
+            layer_expert_data = {}
+            for expert_id in range(len(expert_counts)):
+                expert_data = {
+                    'token_count': int(expert_counts[expert_id]),
+                    'node_id': expert_id // experts_per_node,
+                }
+                if expert_id in expert_incast_degrees:
+                    expert_data.update(expert_incast_degrees[expert_id])
+                else:
+                    expert_data.update({
+                        'max_incast': 0,
+                        'avg_incast': 0.0,
+                        'appearances': 0
+                    })
+                layer_expert_data[expert_id] = expert_data
+
+            # Collect per-forward data
+            per_forward_data = []
+            if incast_stats:
+                for forward_data in incast_stats['per_forward_incast']:
+                    forward_id = forward_data['forward_id']
+                    incast_data = forward_data['incast_data']
+                    token_distribution = forward_data.get('expert_token_distribution', {})
+
+                    # Build per-expert data for this forward pass
+                    forward_experts = {}
+                    for expert_id, data in incast_data.items():
+                        forward_experts[expert_id] = {
+                            'num_tokens': int(data.get('num_tokens', 0)),
+                            'num_remote_senders': int(data['num_remote_senders']),
+                        }
+
+                    per_forward_data.append({
+                        'forward_id': int(forward_id),
+                        'experts': forward_experts,
+                        'token_distribution': {int(k): int(v) for k, v in token_distribution.items()}  # expert_id -> token_count
+                    })
+
+            # Add to detailed stats
+            detailed_stats['layers'][layer_id] = {
+                'total_forwards': int(total_forwards),
+                'total_tokens': int(total_tokens),
+                'avg_tokens_per_forward': float(avg_tokens_per_forward),
+                'max_tokens': int(max_tokens),
+                'min_tokens': int(min_tokens),
+                'avg_tokens': float(avg_tokens),
+                'median_tokens': float(median_tokens),
+                'experts_used': int(experts_used),
+                'experts_cumulative': layer_expert_data,
+                'per_forward': per_forward_data
+            }
+            print(f"    ✓ Layer {layer_id}: Collected {total_forwards} forwards, {len(per_forward_data)} per-forward entries")
+
+            # Write incrementally to file if output_file is specified
+            if output_file:
+                try:
+                    with open(output_file, 'w') as f:
+                        json.dump(detailed_stats, f, indent=2)
+                    print(f"    ✓ Saved to {output_file}")
+                except Exception as e:
+                    print(f"    ⚠️  Failed to write: {e}")
+
+            all_layer_stats.append({
+                'layer_id': layer_id,
+                'expert_counts': expert_counts,
+                'max_tokens': max_tokens,
+                'min_tokens': min_tokens,
+                'avg_tokens': avg_tokens,
+                'median_tokens': median_tokens,
+                'experts_used': experts_used,
+                'total_forwards': total_forwards,
+                'total_tokens': total_tokens,
+                'avg_tokens_per_forward': avg_tokens_per_forward,
+            })
+
+            print(f"\nLayer {layer_id}:")
+            print(f"  Total forward passes: {total_forwards}")
+            print(f"  Total tokens processed: {total_tokens}")
+            print(f"  Avg tokens per forward: {avg_tokens_per_forward:.1f}")
+            print(f"  Expert token counts (cumulative):")
+            print(f"    Max: {max_tokens}, Min: {min_tokens}, Avg: {avg_tokens:.2f}, Median: {median_tokens:.0f}")
+            print(f"    Experts used: {experts_used}/{len(expert_counts)}")
+
+            # Show distribution of token counts
+            print(f"  Token count distribution:")
+            unique_counts = np.unique(expert_counts)
+            for count in sorted(unique_counts)[:10]:  # Show first 10 unique values
+                num_experts = (expert_counts == count).sum()
+                pct = num_experts / len(expert_counts) * 100
+                print(f"    {count} tokens: {num_experts} experts ({pct:.1f}%)")
+
+    # Check if load is balanced per forward pass (estimate)
+    if all_layer_stats:
+        print(f"\n{'='*80}")
+        print("LOAD BALANCE ANALYSIS")
+        print(f"{'='*80}")
+
+        capacity = 8  # Expert choice capacity
+        print(f"\nEstimated capacity constraint (per forward pass): {capacity}")
+        print("\nPer-layer analysis:")
+
+        for stats in all_layer_stats:
+            layer_id = stats['layer_id']
+            total_forwards = stats['total_forwards']
+            expert_counts = stats['expert_counts']
+
+            # Estimate max tokens per expert per forward pass
+            # This is a rough estimate: max_cumulative / num_forwards
+            estimated_max_per_forward = expert_counts.max() / total_forwards
+
+            print(f"  Layer {layer_id}:")
+            print(f"    Cumulative max: {expert_counts.max()}, Estimated max per forward: {estimated_max_per_forward:.2f}")
+
+            if estimated_max_per_forward > capacity * 1.5:
+                print(f"    ⚠️  Possible capacity violations (estimated)")
+            else:
+                print(f"    ✓ Likely within capacity constraint")
+
+    # Per-forward token distribution uniformity analysis
+    print(f"\n{'='*80}")
+    print("PER-FORWARD EXPERT TOKEN DISTRIBUTION ANALYSIS")
+    print(f"{'='*80}")
+
+    all_per_forward_token_stats = []
+    for layer_id, moe_layer in moe_layers:
+        if not hasattr(moe_layer, 'get_incast_statistics'):
+            continue
+
+        incast_stats = moe_layer.get_incast_statistics()
+        num_experts = moe_layer.num_experts if hasattr(moe_layer, 'num_experts') else 256
+
+        layer_forward_stats = []
+        for forward_data in incast_stats['per_forward_incast']:
+            token_dist = forward_data.get('expert_token_distribution', {})
+            if token_dist:
+                counts = list(token_dist.values())
+                if counts:
+                    max_count = max(counts)
+                    min_count = min(counts)
+                    avg_count = sum(counts) / len(counts)
+                    num_active_experts = len(counts)
+                    total_tokens = sum(counts)
+
+                    layer_forward_stats.append({
+                        'forward_id': forward_data['forward_id'],
+                        'num_active_experts': num_active_experts,
+                        'total_tokens': total_tokens,
+                        'max_tokens': max_count,
+                        'min_tokens': min_count,
+                        'avg_tokens': avg_count,
+                        'imbalance_ratio': max_count / avg_count if avg_count > 0 else 0,
+                    })
+
+        if layer_forward_stats:
+            # Aggregate stats across all forwards for this layer
+            avg_active = np.mean([s['num_active_experts'] for s in layer_forward_stats])
+            avg_max = np.mean([s['max_tokens'] for s in layer_forward_stats])
+            avg_min = np.mean([s['min_tokens'] for s in layer_forward_stats])
+            avg_avg = np.mean([s['avg_tokens'] for s in layer_forward_stats])
+            avg_imbalance = np.mean([s['imbalance_ratio'] for s in layer_forward_stats])
+            max_imbalance = max([s['imbalance_ratio'] for s in layer_forward_stats])
+
+            print(f"\nLayer {layer_id}:")
+            print(f"  Number of forward passes: {len(layer_forward_stats)}")
+            print(f"  Avg active experts per forward: {avg_active:.1f} / {num_experts}")
+            print(f"  Per-forward token stats (averaged):")
+            print(f"    Max tokens per expert: {avg_max:.2f}")
+            print(f"    Min tokens per expert: {avg_min:.2f}")
+            print(f"    Avg tokens per expert: {avg_avg:.2f}")
+            print(f"  Imbalance ratio (max/avg): avg={avg_imbalance:.2f}, max={max_imbalance:.2f}")
+
+            if avg_imbalance > 2.0:
+                print(f"    ⚠️  Token distribution is NOT uniform (imbalance ratio > 2.0)")
+            else:
+                print(f"    ✓ Token distribution is relatively uniform")
+
+            all_per_forward_token_stats.append({
+                'layer_id': layer_id,
+                'per_forward': layer_forward_stats
+            })
+
+    # Add to detailed stats for JSON output
+    detailed_stats['per_forward_token_stats'] = all_per_forward_token_stats
 
     print(f"\n{'='*80}")
     print("AGGREGATED INCAST ANALYSIS (ACROSS ALL LAYERS)")
@@ -1060,6 +1636,27 @@ def print_aggregated_incast_statistics(moe_layers, experts_per_node=8):
                   f"{stat['avg']:<8.1f} {stat['freq']:<8}")
     else:
         print("\nNo incast data collected. Make sure incast statistics are enabled.")
+
+    # Add summary statistics to detailed_stats
+    if all_incast_degrees:
+        detailed_stats['summary'] = {
+            'total_forwards': int(total_forwards),
+            'total_layers': len(moe_layers),
+            'max_incast_degree': int(max(all_incast_degrees)),
+            'min_incast_degree': int(min(all_incast_degrees)),
+            'avg_incast_degree': float(sum(all_incast_degrees) / len(all_incast_degrees)),
+            'median_incast_degree': int(sorted(all_incast_degrees)[len(all_incast_degrees)//2])
+        }
+
+    # Write detailed statistics to file if output_file is specified
+    if output_file:
+        print(f"\nWriting detailed per-layer, per-expert statistics to: {output_file}")
+        try:
+            with open(output_file, 'w') as f:
+                json.dump(detailed_stats, f, indent=2)
+            print(f"✓ Successfully wrote statistics to {output_file}")
+        except Exception as e:
+            print(f"⚠️  Failed to write statistics to file: {e}")
 
     print(f"\n{'='*80}\n")
 
@@ -1740,6 +2337,7 @@ class LLaDA2SGLangLM(nn.Module):
         #     param.data[:] = loaded_weight
         params_dict = dict(self.named_parameters())
         buffer_dict = dict(self.named_buffers())
+
         for name, loaded_weight in weights.items():
             if name in params_dict:
                 param = params_dict[name]
@@ -2085,6 +2683,8 @@ class LLaDA2SGLangLM(nn.Module):
             device = self.device
         self.load_state_dict(model_path, strict=False, dtype=torch_dtype, device=device)
         self.init_h2e_module()
+        # Prepare expert choice weights after loading (before activations are allocated)
+        self.after_processing()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -2106,7 +2706,7 @@ class LLaDA2SGLangLM(nn.Module):
                         print(f"Fixing scalar input_scale for {name}")
                         module.input_scale.data = module.input_scale.data.unsqueeze_(0)
                 module.quant_method.process_weights_after_loading(module)
-    
+
     def after_processing(self):
         if self.quant_config is not None:
             self.after_loading()

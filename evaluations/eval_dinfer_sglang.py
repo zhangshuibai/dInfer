@@ -72,6 +72,14 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
 
     from sglang.srt.layers.dp_attention import initialize_dp_attention
     model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+
+    # Set routing strategy for Expert Choice
+    if hasattr(args, 'routing_strategy') and args.routing_strategy == 'expert_choice':
+        print(f"[Setting Expert Choice routing with capacity={args.expert_capacity if hasattr(args, 'expert_capacity') else 'auto'}]")
+        model_config.routing_strategy = 'expert_choice'
+        if hasattr(args, 'expert_capacity') and args.expert_capacity is not None:
+            model_config.expert_capacity = args.expert_capacity
+
     server_args = ServerArgs(model_path=args.model_name, enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
     try:
         from sglang.srt.server_args import set_global_server_args_for_scheduler
@@ -98,8 +106,14 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
         if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'enable_incast_statistics'):
             layer.mlp.enable_incast_statistics(experts_per_node=8)
             layer.mlp.reset_incast_statistics()
+            # Also enable co-selection matrix statistics
+            if hasattr(layer.mlp, 'enable_coselection_statistics'):
+                layer.mlp.enable_coselection_statistics()
+            # Also enable physical communication matrix statistics
+            if hasattr(layer.mlp, 'enable_communication_statistics'):
+                layer.mlp.enable_communication_statistics(num_gpus=32, experts_per_gpu=8)
             moe_layers_for_incast.append((i, layer.mlp))
-    print(f"Enabled incast statistics for {len(moe_layers_for_incast)} MoE layers")
+    print(f"Enabled incast, co-selection, and communication statistics for {len(moe_layers_for_incast)} MoE layers")
 
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     max_length = max(input_lengths)+args.gen_len
@@ -261,8 +275,26 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
             print("\n" + "="*80)
             print("CROSS-NODE INCAST STATISTICS")
             print("="*80)
-            from dinfer.model.modeling_llada2_moe_sglang import print_aggregated_incast_statistics
-            print_aggregated_incast_statistics(moe_layers_for_incast, experts_per_node=8)
+            from dinfer.model.modeling_llada2_moe_sglang import print_aggregated_incast_statistics, save_coselection_matrices, save_communication_matrices
+
+            # Generate output file path for detailed statistics
+            output_dir = os.path.dirname(args.save_path) if args.save_path else './outputs'
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, 'expert_statistics_detailed.json')
+
+            print_aggregated_incast_statistics(moe_layers_for_incast, experts_per_node=8, output_file=output_file)
+
+            # Save co-selection matrices (256x256 matrix per layer per forward)
+            # matrix[i][j] = number of tokens selected by both expert i and expert j
+            coselection_file = os.path.join(output_dir, 'coselection_matrices.npz')
+            moe_layers_only = [layer for _, layer in moe_layers_for_incast]
+            save_coselection_matrices(moe_layers_only, coselection_file)
+
+            # Save physical communication matrices ([32, 32] matrix per layer per forward)
+            # Outputs: dispatch_matrices.npz and combine_matrices.npz
+            # dispatch[i][j] = tokens GPU i sends to GPU j (token on i, expert on j)
+            # combine[i][j] = results GPU i sends to GPU j (expert on i, token on j)
+            save_communication_matrices(moe_layers_only, output_dir)
 
         filename = args.save_path
         with open (filename, 'w') as f:
@@ -308,6 +340,8 @@ class EvalConfig:
     save_samples: bool = False
     speed_path: str = ''
     enable_remask: bool = False
+    routing_strategy: str = 'token_choice'
+    expert_capacity: int = None
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -353,12 +387,16 @@ class DInferEvalHarness(LM):
         model_type = 'llada2',
         save_samples = False,
         enable_remask = False,
+        routing_strategy = 'token_choice',
+        expert_capacity = None,
         **kwargs
     ):
 
         super().__init__()
-        
+
         self.model_path = model_path
+        self.routing_strategy = routing_strategy
+        self.expert_capacity = expert_capacity
         self.mask_id = mask_id
         self.eos_id = eos_id
         self.mc_num = mc_num
@@ -619,7 +657,7 @@ class DInferEvalHarness(LM):
             gpus = [int(gpu) for gpu in self.gpus.split(';')]
         else:
             gpus = [0]  # fallback
-        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path, "enable_remask": self.enable_remask}
+        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path, "enable_remask": self.enable_remask, "routing_strategy": self.routing_strategy, "expert_capacity": self.expert_capacity}
         args = EvalConfig(**args)
         args.tp_size = len(gpus)
         args.master_port = self.master_port
