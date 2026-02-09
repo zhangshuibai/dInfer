@@ -73,12 +73,15 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
     from sglang.srt.layers.dp_attention import initialize_dp_attention
     model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
 
-    # Set routing strategy for Expert Choice
-    if hasattr(args, 'routing_strategy') and args.routing_strategy == 'expert_choice':
-        print(f"[Setting Expert Choice routing with capacity={args.expert_capacity if hasattr(args, 'expert_capacity') else 'auto'}]")
-        model_config.routing_strategy = 'expert_choice'
+    # Set routing strategy (Token Choice or Expert Choice)
+    routing_strategy = getattr(args, 'routing_strategy', 'token_choice')
+    model_config.routing_strategy = routing_strategy
+    if routing_strategy == 'expert_choice':
+        print(f"[Routing Strategy] Expert Choice (capacity={args.expert_capacity if hasattr(args, 'expert_capacity') and args.expert_capacity else 'auto'})")
         if hasattr(args, 'expert_capacity') and args.expert_capacity is not None:
             model_config.expert_capacity = args.expert_capacity
+    else:
+        print(f"[Routing Strategy] Token Choice (top_k={model_config.num_experts_per_tok})")
 
     server_args = ServerArgs(model_path=args.model_name, enable_dp_attention=True, trust_remote_code=True, tp_size=args.tp_size, dp_size = 1, pp_size = 1)
     try:

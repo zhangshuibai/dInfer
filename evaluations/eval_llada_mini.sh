@@ -28,7 +28,7 @@ model_type='llada2' # llada2 (for llada2-mini)
 use_bd=True # use block diffusion
 master_port="23456"
 save_samples=False # save samples
-routing_strategy='token_choice' # 'token_choice' (default) or 'expert_choice' for Expert Choice routing
+routing_strategy='expert_choice' # 'token_choice' (default) or 'expert_choice' for Expert Choice routing
 expert_capacity='' # capacity per expert for expert_choice (leave empty for auto: n*top_k/num_experts)
 limit=100 # number of samples to run (set to empty '' for full dataset)
 # for llada 1.5 use tasks gsm8k_llada1.5 mbpp_sanitized_llada1.5

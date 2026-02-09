@@ -475,9 +475,13 @@ class LLaDA2SparseMoeBlock(nn.Module):
         self.num_experts = config.num_experts
         self._ec_debug_counter = 0  # Counter for debug prints
 
-        # Print routing strategy on initialization
-        if self.routing_strategy == "expert_choice":
-            print(f"[MoE Layer Init] Expert Choice routing enabled (num_experts={self.num_experts}, C = n*{self.top_k}/{self.num_experts})")
+        # Print routing strategy on initialization (only once, not for every layer)
+        if not hasattr(self.__class__, '_routing_strategy_printed'):
+            self.__class__._routing_strategy_printed = True
+            if self.routing_strategy == "expert_choice":
+                print(f"[MoE] Expert Choice routing (E={self.num_experts}, C = n*{self.top_k}/{self.num_experts})")
+            else:
+                print(f"[MoE] Token Choice routing (E={self.num_experts}, top_k={self.top_k})")
 
         self.num_experts = (
             config.num_experts 
@@ -642,9 +646,12 @@ class LLaDA2SparseMoeBlock(nn.Module):
                 renormalize=self.norm_topk_prob,
             )
 
-            # Note: Statistics collection is skipped for Expert Choice mode
-            # because expert_tokens contains token indices [0, N), not expert indices [0, E)
-            # The existing stats functions expect [N, K] with expert indices
+            # Collect statistics for Expert Choice mode
+            # Expert Choice format: expert_tokens [E, C] contains token indices
+            if self.enable_coselection_stats:
+                self._update_coselection_stats_ec(routing_output.expert_tokens)
+            if self.enable_communication_stats:
+                self._update_communication_stats_ec(routing_output.expert_tokens)
 
             # Use expert choice fused experts with native [E, C] format
             # Auto-detect weight format based on shape
@@ -759,6 +766,89 @@ class LLaDA2SparseMoeBlock(nn.Module):
             flat_idx = src_gpu * num_gpus + dst_gpu
             ones = torch.ones_like(flat_idx, dtype=torch.int64)
             comm_matrix.view(-1).scatter_add_(0, flat_idx, ones)
+
+        # Store as CPU numpy array
+        self.communication_matrices.append(comm_matrix.cpu().numpy())
+
+    def _update_coselection_stats_ec(self, expert_tokens: torch.Tensor):
+        """
+        Compute expert co-selection matrix for Expert Choice routing.
+
+        Expert Choice format: expert_tokens [E, C] where expert_tokens[e, c] is the
+        token index selected by expert e at position c.
+
+        matrix[i][j] = number of tokens selected by BOTH expert i and expert j
+
+        Args:
+            expert_tokens: [E, C] tensor of token indices per expert
+        """
+        # Skip during CUDA graph capture
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+
+        E, C = expert_tokens.shape
+        num_tokens = expert_tokens.max().item() + 1 if expert_tokens.numel() > 0 else 0
+
+        # Build binary assignment matrix [N, E] where assignment[t, e] = 1 if expert e selected token t
+        assignment = torch.zeros(num_tokens, E, dtype=torch.int32, device=expert_tokens.device)
+
+        # For each expert, mark which tokens it selected
+        expert_idx = torch.arange(E, device=expert_tokens.device).unsqueeze(1).expand(-1, C)  # [E, C]
+        token_idx = expert_tokens.long()  # [E, C]
+
+        # Flatten and scatter
+        assignment[token_idx.flatten(), expert_idx.flatten()] = 1
+
+        # Compute co-selection matrix: C = A^T @ A
+        # C[i,j] = number of tokens selected by both expert i and expert j
+        coselection = torch.mm(assignment.t().float(), assignment.float())
+
+        # Store as CPU numpy array
+        self.coselection_matrices.append(coselection.cpu().numpy())
+
+    def _update_communication_stats_ec(self, expert_tokens: torch.Tensor):
+        """
+        Compute physical GPU-to-GPU communication matrix for Expert Choice routing.
+
+        Expert Choice format: expert_tokens [E, C] where expert_tokens[e, c] is the
+        token index selected by expert e at position c.
+
+        Simulates the all2all communication pattern:
+        - Assumes tokens are distributed evenly across num_gpus GPUs
+        - Assumes experts are distributed evenly (experts_per_node per GPU)
+        - comm_matrix[i][j] = number of tokens GPU i sends to GPU j
+
+        Args:
+            expert_tokens: [E, C] tensor of token indices per expert
+        """
+        # Skip during CUDA graph capture
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+
+        E, C = expert_tokens.shape
+        num_tokens = expert_tokens.max().item() + 1 if expert_tokens.numel() > 0 else 0
+        num_gpus = self.num_gpus
+        experts_per_gpu = E // num_gpus  # e.g., 256/32 = 8
+
+        # Initialize communication matrix [num_gpus, num_gpus]
+        comm_matrix = torch.zeros(num_gpus, num_gpus, dtype=torch.int64, device=expert_tokens.device)
+
+        # Compute source GPU for each token (assuming even distribution)
+        # Token t is on GPU (t * num_gpus) // num_tokens
+        token_src_gpu = (expert_tokens.long() * num_gpus) // max(1, num_tokens)  # [E, C]
+
+        # Compute destination GPU for each expert
+        # Expert e is on GPU e // experts_per_gpu
+        expert_dst_gpu = torch.arange(E, device=expert_tokens.device) // experts_per_gpu  # [E]
+        expert_dst_gpu = expert_dst_gpu.unsqueeze(1).expand(-1, C)  # [E, C]
+
+        # Flatten and count communications
+        src_flat = token_src_gpu.flatten()  # [E*C]
+        dst_flat = expert_dst_gpu.flatten()  # [E*C]
+
+        flat_idx = src_flat * num_gpus + dst_flat
+        ones = torch.ones_like(flat_idx, dtype=torch.int64)
+        comm_matrix.view(-1).scatter_add_(0, flat_idx, ones)
 
         # Store as CPU numpy array
         self.communication_matrices.append(comm_matrix.cpu().numpy())
