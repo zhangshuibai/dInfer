@@ -636,7 +636,7 @@ class LLaDA2SparseMoeBlock(nn.Module):
 
             # Debug print for first few calls
             if self._ec_debug_counter < 2:
-                print(f"[Expert Choice] n={num_tokens}, C={capacity}")
+                print(f"[Expert Choice] n={num_tokens}, C={capacity}, tp_size={self.tp_size}")
                 self._ec_debug_counter += 1
 
             # Get expert choice routing output in native [E, C] format
@@ -645,6 +645,54 @@ class LLaDA2SparseMoeBlock(nn.Module):
                 capacity=capacity,
                 renormalize=self.norm_topk_prob,
             )
+
+            # ========== Tensor Parallel Support ==========
+            # In TP mode, each GPU only has a subset of experts
+            # Need to filter routing output to only include local experts
+            if self.tp_size > 1:
+                # Fix: Use tensor_model_parallel_rank/size for expert distribution
+                # moe_tp_rank/size are for MoE-specific parallelism
+                # tp_rank/size are for general tensor parallelism (which distributes experts)
+                tp_rank = get_tensor_model_parallel_rank()
+                moe_tp_rank = get_moe_tensor_parallel_rank()
+                moe_tp_size = get_moe_tensor_parallel_world_size()
+
+                # Get weight shapes before filtering
+                w1 = self.experts.w13_weight
+                w2 = self.experts.w2_weight
+
+                # Debug: print shapes before filtering
+                if self._ec_debug_counter < 2:
+                    print(f"[Expert Choice TP Debug rank={tp_rank}] tp_rank={tp_rank}, tp_size={self.tp_size}, moe_tp_rank={moe_tp_rank}, moe_tp_size={moe_tp_size}")
+                    print(f"[Expert Choice TP Debug rank={tp_rank}] routing_output.num_experts={routing_output.num_experts}, capacity={routing_output.capacity}")
+                    print(f"[Expert Choice TP Debug rank={tp_rank}] routing_output.expert_tokens.shape={routing_output.expert_tokens.shape}")
+                    print(f"[Expert Choice TP Debug rank={tp_rank}] w1.shape={w1.shape}, w2.shape={w2.shape}")
+
+                # Calculate local expert range for this GPU
+                # Use self.tp_size and tp_rank for expert distribution
+                # When tp_size=8, each GPU holds 256/8=32 experts
+                experts_per_gpu = self.num_experts // self.tp_size
+                local_expert_start = tp_rank * experts_per_gpu
+                local_expert_end = local_expert_start + experts_per_gpu
+
+                if self._ec_debug_counter < 2:
+                    print(f"[Expert Choice TP Debug rank={tp_rank}] experts_per_gpu={experts_per_gpu}, local range: [{local_expert_start}, {local_expert_end})")
+
+                # Filter expert_tokens and expert_weights to only include local experts
+                # routing_output.expert_tokens: [E, C], routing_output.expert_weights: [E, C]
+                local_expert_tokens = routing_output.expert_tokens[local_expert_start:local_expert_end]
+                local_expert_weights = routing_output.expert_weights[local_expert_start:local_expert_end]
+
+                if self._ec_debug_counter < 2:
+                    print(f"[Expert Choice TP Debug rank={tp_rank}] After filtering: local_expert_tokens.shape={local_expert_tokens.shape}")
+
+                # Create new routing output with local experts only
+                routing_output = ExpertChoiceRoutingOutput(
+                    expert_tokens=local_expert_tokens,
+                    expert_weights=local_expert_weights,
+                    num_experts=experts_per_gpu,  # Update to local expert count
+                    capacity=routing_output.capacity,
+                )
 
             # Collect statistics for Expert Choice mode
             # Expert Choice format: expert_tokens [E, C] contains token indices
@@ -664,7 +712,7 @@ class LLaDA2SparseMoeBlock(nn.Module):
             # Check if w1's dim1 == hidden_dim (triton format) or dim2 == hidden_dim (standard)
             use_triton_format = (w1.shape[1] == hidden_dim)
 
-            return expert_choice_fused_experts(
+            expert_output = expert_choice_fused_experts(
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,
@@ -672,6 +720,12 @@ class LLaDA2SparseMoeBlock(nn.Module):
                 activation="silu",
                 use_triton_weight_format=use_triton_format,
             )
+
+            # In TP mode, need to all-reduce across GPUs since each GPU computed different experts
+            if self.tp_size > 1:
+                expert_output = tensor_model_parallel_all_reduce(expert_output)
+
+            return expert_output
         else:
             # Standard Token Choice routing
             topk_output = self.topk(hidden_states, router_logits)

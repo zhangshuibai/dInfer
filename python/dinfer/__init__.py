@@ -16,6 +16,7 @@ from .decoding.parallel_strategy import ThresholdParallelDecoder,CreditThreshold
 from .decoding.generate_uniform import DiffusionLLM, BlockWiseDiffusionLLM, VicinityCacheDiffusionLLM, BlockWiseDiffusionLLMWithSP, BlockDiffusionLLMAttnmask, BlockDiffusionLLM
 from .decoding.generate_uniform import IterSmoothDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM
 
-from .decoding.serving import DiffusionLLMServing, SamplingParams
+# Serving module requires vLLM - commented out for SGLang-only setup
+# from .decoding.serving import DiffusionLLMServing, SamplingParams
 
 from .decoding.utils import BlockIteratorFactory, KVCacheFactory

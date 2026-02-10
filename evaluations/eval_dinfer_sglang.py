@@ -27,7 +27,8 @@ from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
 from dinfer.decoding.diffusion_runner import ModelRunner
-from dinfer.model import LLaDAMoeModelLM, LLaDAModelLM, LLaDA2MoeModelLM
+# Removed vLLM-based model imports - not needed for SGLang backend
+# from dinfer.model import LLaDAMoeModelLM, LLaDAModelLM, LLaDA2MoeModelLM
 from dinfer import BlockIteratorFactory, KVCacheFactory
 from dinfer import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder, BlockWiseDiffusionLLM, IterSmoothDiffusionLLM, VicinityCacheDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM, BlockDiffusionLLM    
 from sglang.srt.server_args import ServerArgs
@@ -680,6 +681,17 @@ class DInferEvalHarness(LM):
                 p.start()
             for p in procs:
                 p.join()
+                # Check if process exited successfully
+                if p.exitcode != 0:
+                    raise RuntimeError(f"Worker process on GPU {gpus[procs.index(p)]} failed with exit code {p.exitcode}. "
+                                     f"Check the error messages above for details (likely in model initialization or forward pass).")
+
+        # Check if output file was created
+        if not os.path.exists(self.save_path):
+            raise FileNotFoundError(f"Output file {self.save_path} was not created. "
+                                  f"This usually means the worker processes crashed during execution. "
+                                  f"Check the error messages above for the root cause.")
+
         answers = []
         with open(self.save_path, 'r') as f:
             for line in f :

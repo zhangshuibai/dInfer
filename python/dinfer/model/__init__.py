@@ -16,8 +16,16 @@
 # Modified from LLaDA repos: https://github.com/ML-GSAI/LLaDA
 
 from .configuration_llada import LLaDAConfig
-from .modeling_llada import LLaDAModelLM
-from .modeling_fused_olmoe import FusedOlmoeForCausalLM as LLaDAMoeModelLM
-from .modeling_llada2_moe import LLaDA2MoeModelLM
-__all__ = ['LLaDAConfig', 'LLaDAModelLM', 'LLaDAMoeModelLM', 'LLaDA2MoeModelLM']
+
+# vLLM-based models (commented out to avoid vLLM dependency conflicts)
+# Uncomment these if you need vLLM backend for LLaDA/LLaDA-MoE models
+# from .modeling_llada import LLaDAModelLM
+# from .modeling_fused_olmoe import FusedOlmoeForCausalLM as LLaDAMoeModelLM
+# from .modeling_llada2_moe import LLaDA2MoeModelLM
+
+# SGLang-based models (for LLaDA2 with SGLang backend)
+from .modeling_llada2_moe_sglang import LLaDA2SGLangLM
+
+__all__ = ['LLaDAConfig', 'LLaDA2SGLangLM']
+# __all__ = ['LLaDAConfig', 'LLaDAModelLM', 'LLaDAMoeModelLM', 'LLaDA2MoeModelLM']
 

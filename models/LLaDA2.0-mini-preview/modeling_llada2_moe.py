@@ -17,16 +17,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PyTorch BailingMoE model."""
+"""PyTorch LLaDA2MoE model."""
 
 import math
 import warnings
-from typing import List, Optional, Tuple, Union, Literal
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
-import tqdm
+from torch.nn import CrossEntropyLoss
 
 from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache, DynamicCache
@@ -36,7 +37,10 @@ from transformers.modeling_attn_mask_utils import (
     _prepare_4d_causal_attention_mask,
     _prepare_4d_causal_attention_mask_for_sdpa,
 )
-from transformers.modeling_outputs import MoeModelOutputWithPast
+from transformers.modeling_outputs import (
+    MoeModelOutputWithPast,
+    MoeCausalLMOutputWithPast,
+)
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from transformers.modeling_utils import PreTrainedModel
 from transformers.pytorch_utils import ALL_LAYERNORM_LAYERS, is_torch_greater_or_equal_than_1_13
@@ -48,45 +52,9 @@ from transformers.utils import (
     logging,
     replace_return_docstrings,
 )
-
-# Handle is_torch_fx_available for different transformers versions
-try:
-    from transformers.utils.import_utils import is_torch_fx_available
-except ImportError:
-    # For transformers >= 5.0, check torch.fx availability directly
-    def is_torch_fx_available():
-        try:
-            import torch.fx
-            return True
-        except ImportError:
-            return False
+from transformers.utils.import_utils import is_torch_fx_available
 from .configuration_llada2_moe import LLaDA2MoeConfig
-from torch.nn.modules.normalization import RMSNorm
-import torch.distributed as dist
-from ..decoding.utils import KVCache
 from transformers.generation.utils import GenerationMixin
-from dataclasses import dataclass
-from transformers.utils import ModelOutput
-
-from pathlib import Path
-import json
-from safetensors.torch import load_file
-from functools import partial
-from vllm.model_executor.layers.fused_moe import FusedMoE
-import re
-from vllm.model_executor.models.utils import maybe_prefix
-from vllm.model_executor.layers.linear import (ColumnParallelLinear,
-                        ReplicatedLinear,
-                        QKVParallelLinear,
-                        RowParallelLinear)
-def torch_all_reduce(tensor):
-    torch.distributed.all_reduce(tensor)
-    return tensor
-import vllm.distributed as vllm_distributed
-vllm_distributed.tensor_model_parallel_all_reduce = torch_all_reduce
-
-from vllm.distributed import (divide, get_tensor_model_parallel_rank,
-                              get_tensor_model_parallel_world_size)
 
 
 if is_flash_attn_2_available():
@@ -108,248 +76,6 @@ logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "LLaDA2MoeConfig"
 
 
-def roll_tensor(tensor, shifts=-1, dims=-1, fill_value=0):
-    """Roll the tensor input along the given dimension(s).
-    Inserted elements are set to be 0.0.
-    """
-    rolled_tensor = torch.roll(tensor, shifts=shifts, dims=dims)
-    rolled_tensor.select(dims, shifts).fill_(fill_value)
-    return rolled_tensor, rolled_tensor.sum()
-
-def replace_linear_class(
-    linear: nn.Linear, style: Literal["colwise", "rowwise", "qkv"],
-    quant_config, model_config
-) -> Union[ColumnParallelLinear, RowParallelLinear]:
-    """
-    Replace nn.Linear with one of vLLM's tensor parallel linear classes.
-
-    Args:
-        linear (nn.Linear): `nn.Linear` to be replaced.
-        style (str): Tensor parallel style of the new linear, e.g. "colwise".
-        quant_config (QuantConfig): Quantization config for the new linear.
-    Returns:
-        Union[ColumnParallelLinear, RowParallelLinear]: The new linear.
-    """
-
-    if not isinstance(style, str):
-        raise ValueError(
-            f"Unsupported parallel style type {type(style)}, expected str")
-
-    vllm_linear_cls = {
-        "colwise": ColumnParallelLinear,
-        "rowwise": RowParallelLinear,
-        "qkv": QKVParallelLinear
-    }.get(style, ReplicatedLinear)
-    if style != "qkv":
-        return vllm_linear_cls(
-            input_size=linear.in_features,
-            output_size=linear.out_features,
-            bias=linear.bias is not None,
-            quant_config=quant_config,
-            return_bias=False,
-        )
-    else:
-        return QKVParallelLinear(
-            hidden_size = model_config.hidden_size,
-            head_size=model_config.head_dim,
-            total_num_heads=model_config.num_attention_heads,
-            total_num_kv_heads=model_config.num_key_value_heads,
-            bias=linear.bias is not None,
-            quant_config=quant_config,
-            return_bias=False,
-        )     
-def _all_gather_cat(
-    tensor: torch.Tensor,
-    dim: int = 1,
-    group: Optional[dist.ProcessGroup] = None,
-    normal_len: int = 0,
-    last_len: int = 0,
-) -> torch.Tensor:
-    """
-    Gather tensors along `dim` from all ranks and concatenate them.
-    Only the last chunk may be shorter than `normal_len`; all others are exactly `normal_len`.
-
-    Args:
-        tensor: local tensor on current rank
-        dim: dimension along which to concatenate
-        normal_len: length of the first (world_size-1) ranks along `dim`
-        last_len: length of the last rank along `dim`
-
-    Returns:
-        Concatenated tensor of shape [total_len, ...] along `dim`
-    """
-    world_size = dist.get_world_size(group)
-    rank = dist.get_rank(group)
-    if world_size == 1:
-        return tensor
-
-    # 1. Move the concatenation dimension to 0 for easier all_gather
-    tensor = tensor.movedim(dim, 0)          # [L_local, ...]
-    L_local = tensor.size(0)
-
-    # 2. Compute global length across all ranks
-    total_len = normal_len * (world_size - 1) + last_len
-
-    # 3. Pre-allocate receive buffers (same shape for all ranks, sized for the largest chunk)
-    max_len = max(normal_len, last_len)
-    gather_list = [
-        torch.empty([max_len] + list(tensor.shape[1:]),
-                   dtype=tensor.dtype,
-                   device=tensor.device)
-        for _ in range(world_size)
-    ]
-
-    # 4. Copy local data into the corresponding buffer (only first L_local rows are valid)
-    gather_list[rank][:L_local] = tensor
-
-    # 5. All-gather (communicate only valid parts)
-    dist.all_gather(gather_list, gather_list[rank], group=group)
-
-    # 6. Trim padding and concatenate
-    gathered = torch.cat(gather_list, dim=0)[:total_len]
-
-    # 7. Move dimension back to original position
-    return gathered.movedim(0, dim)    
-
-class H2Embed:
-    def __init__(self, embedding: nn.Embedding, tau: float = 1.0):
-        """
-        W_e : token embedding weights [V, d]
-        tau : temperature; lower values yield sharper distributions
-        """
-        self.embedding = embedding
-        self.W_e = embedding.weight
-        self.tau = tau
-        self.sp_size = 1  # no sequence parallel by default
-
-    def __call__(
-        self,
-        x: torch.Tensor,
-        mask_index: Optional[torch.Tensor] = None,
-        logits: Optional[torch.Tensor] = None,
-        iter_cont_weight: float = 0.0
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: [B, L] token ids
-            mask_index: [B, L] bool tensor, True where continuous embedding should be used
-            logits: [B, L, V] logits used to produce continuous embeddings
-            iter_cont_weight: blending weight between continuous and discrete embeddings
-
-        Returns:
-            Embedded representations [B, L, d]
-        """
-        rank = get_tensor_model_parallel_rank()
-        world_size = get_tensor_model_parallel_world_size()
-        seq_len = x.shape[1]
-
-        # If sequence parallel is enabled, each rank handles a slice of the sequence
-        if self.sp_size > 1:
-            normal_seq_len = (seq_len + self.sp_size - 1) // self.sp_size
-            last_seq_len = seq_len - normal_seq_len * (self.sp_size - 1)
-
-            part_start = normal_seq_len * rank
-            part_end = min(normal_seq_len * (rank + 1), seq_len)
-            x_part = x[:, part_start:part_end]
-
-            if mask_index is not None:
-                mask_part = mask_index[:, part_start:part_end]
-                logits_part = logits[:, part_start:part_end] if logits is not None else None
-            else:
-                mask_part = None
-                logits_part = None
-        else:
-            x_part = x
-            mask_part = mask_index
-            logits_part = logits
-
-        # Base discrete embedding
-        result_part = self.embedding(x_part)
-
-        # Replace selected positions with continuous embeddings
-        if mask_part is not None and logits_part is not None:
-            prob = torch.softmax(logits_part / self.tau, dim=-1)  # [B, L_part, V]
-            input_embeds_h = prob @ self.W_e  # [B, L_part, d]
-
-            # Blend continuous and discrete embeddings
-            result_part = torch.where(
-                mask_part.unsqueeze(-1),
-                iter_cont_weight * input_embeds_h + 1 * result_part,
-                result_part
-            )
-
-        # 4. Gather and concatenate sequence slices across ranks
-        if self.sp_size > 1:
-            out = _all_gather_cat(
-                result_part,
-                dim=1,
-                group=None,
-                normal_len=normal_seq_len,
-                last_len=last_seq_len
-            )
-        else:
-            out = result_part
-
-        return out
-
-
-@dataclass
-class MoEV2CausalLMOutputWithPast(ModelOutput):
-    """
-    Base class for causal language model (or autoregressive) outputs as well as Mixture of Expert's router hidden
-    states terms, to train a MoE model.
-
-    Args:
-        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
-            Language modeling loss (for next-token prediction).
-        logits (`torch.FloatTensor` of shape `(batch_size, sequence_length, config.vocab_size)`):
-            Prediction scores of the language modeling head (scores for each vocabulary token before SoftMax).
-        past_key_values (`Cache`, *optional*, returned when `use_cache=True` is passed or when `config.use_cache=True`):
-            It is a [`~cache_utils.Cache`] instance. For more details, see our [kv cache guide](https://huggingface.co/docs/transformers/en/kv_cache).
-
-            Contains pre-computed hidden-states (key and values in the self-attention blocks) that can be used (see
-            `past_key_values` input) to speed up sequential decoding.
-        hidden_states (`tuple(torch.FloatTensor)`, *optional*, returned when `output_hidden_states=True` is passed or when `config.output_hidden_states=True`):
-            Tuple of `torch.FloatTensor` (one for the output of the embeddings, if the model has an embedding layer, +
-            one for the output of each layer) of shape `(batch_size, sequence_length, hidden_size)`.
-
-            Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
-        attentions (`tuple(torch.FloatTensor)`, *optional*, returned when `output_attentions=True` is passed or when `config.output_attentions=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, num_heads, sequence_length,
-            sequence_length)`.
-
-            Attentions weights after the attention softmax, used to compute the weighted average in the self-attention
-            heads.
-        z_loss (`torch.FloatTensor`, *optional*, returned when `labels` is provided):
-            z_loss for the sparse modules.
-        aux_loss (`torch.FloatTensor`, *optional*, returned when `labels` is provided):
-            aux_loss for the sparse modules.
-        router_logits (`tuple(torch.FloatTensor)`, *optional*, returned when `output_router_logits=True` is passed or when `config.add_router_probs=True`):
-            Tuple of `torch.FloatTensor` (one for each layer) of shape `(batch_size, sequence_length, num_experts)`.
-
-            Router logits of the encoder model, useful to compute the auxiliary loss and the z_loss for the sparse
-            modules.
-    """
-
-    loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[Cache] = None
-    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
-    z_loss: Optional[torch.FloatTensor] = None
-    aux_loss: Optional[torch.FloatTensor] = None
-    router_logits: Optional[tuple[torch.FloatTensor]] = None
-    mtp_loss: Optional[torch.FloatTensor] = None
-    mtp_logits: Optional[tuple[torch.FloatTensor, ...]] = None
-
-
-class MoeV2ModelOutputWithPast(MoeModelOutputWithPast):
-
-    def __init__(self, mtp_hidden_states=None, **kwargs):
-        super().__init__(**kwargs)
-        self.mtp_hidden_states = mtp_hidden_states
-
-
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
     indices = torch.nonzero(attention_mask.flatten(), as_tuple=False).flatten()
@@ -359,24 +85,6 @@ def _get_unpad_data(attention_mask):
         indices,
         cu_seqlens,
         max_seqlen_in_batch,
-    )
-
-
-def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
-    warnings.warn(
-        "Calling `transformers.models.LLaDA2Moe.modeling_LLaDA2Moe._prepare_4d_attention_mask` is deprecated and will be removed in v4.37. Use `transformers.modeling_attn_mask_utils._prepare_4d_attention_mask"
-    )
-    return _prepare_4d_attention_mask(mask=mask, dtype=dtype, tgt_len=tgt_len)
-
-
-def _make_causal_mask(
-    input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
-):
-    warnings.warn(
-        "Calling `transformers.models.LLaDA2Moe.modeling_LLaDA2Moe._make_causal_mask` is deprecated and will be removed in v4.37. Use `transformers.models.LLaDA2Moe.modeling_LLaDA2Moe.AttentionMaskConverter._make_causal_mask"
-    )
-    return AttentionMaskConverter._make_causal_mask(
-        input_ids_shape=input_ids_shape, dtype=dtype, device=device, past_key_values_length=past_key_values_length
     )
 
 
@@ -443,7 +151,7 @@ def rotate_half(x):
 
 
 # Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
-def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Args:
@@ -451,6 +159,9 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
         k (`torch.Tensor`): The key tensor.
         cos (`torch.Tensor`): The cosine part of the rotary embedding.
         sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`):
+            The position indices of the tokens corresponding to the query and key tensors. For example, this can be
+            used to pass offsetted position ids when working with a KV-cache.
         unsqueeze_dim (`int`, *optional*, defaults to 1):
             The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
             sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
@@ -558,90 +269,83 @@ class LLaDA2MoeGate(nn.Module):
 
         return topk_idx, topk_weight, logits
 
-    def get_logits(self, hidden_states):
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
-        return logits
 
-    def routing(self, hidden_states, gating_output, topk, renormalize):
-        scores = torch.sigmoid(gating_output.float()).type_as(gating_output)
-
-        scores_for_routing = scores + self.expert_bias
-        _, topk_idx = self.group_limited_topk(scores_for_routing)
-
-        scores = torch.gather(scores, dim=1, index=topk_idx).type_as(gating_output)
-
-        topk_weight = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if self.top_k > 1 else scores
-        topk_weight = topk_weight * self.routed_scaling_factor
-
-        return topk_weight, topk_idx
-
-def static_routing_function(gate, hidden_states, gating_output, topk, renormalize):
-    return gate.routing(hidden_states, gating_output, topk, renormalize)
 class LLaDA2MoeSparseMoeBlock(nn.Module):
-    """A tensor-parallel MoE implementation for Olmoe that shards each expert
-    across all ranks.
-
-    Each expert's weights are sharded across all ranks and a fused MoE
-    kernel is used for the forward pass, and finally we reduce the outputs
-    across ranks.
+    """
+    A mixed expert module containing shared experts.
     """
 
-    def __init__(self,
-                 config,
-                 prefix: str = ""):
+    def __init__(self, config: LLaDA2MoeConfig):
         super().__init__()
         self.config = config
-        self.hidden_size = config.hidden_size
-
-        self.num_experts = config.num_experts
-        self.top_k = config.num_experts_per_tok
-        self.norm_topk_prob = config.norm_topk_prob
-
-        # Gate always runs at half / full precision for now.
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self._setup_experts()
         self.gate = LLaDA2MoeGate(config)
-        # print('config.num_shared_experts', config.num_shared_experts)
         if config.num_shared_experts is not None:
-            # print('config.num_shared_experts is not None!')
             self.shared_experts = LLaDA2MoeMLP(
                 config=config, intermediate_size=config.moe_intermediate_size * config.num_shared_experts
             )
-        # custom_routing = partial(custom_routing_function, gate=self.gate)
-        self.experts = FusedMoE(num_experts=self.num_experts,
-                                top_k=self.top_k,
-                                hidden_size=self.hidden_size,
-                                intermediate_size=config.moe_intermediate_size,
-                                reduce_results=True,
-                                quant_config=None,
-                                tp_size=None,
-                                custom_routing_function=partial(static_routing_function, self.gate),
-                                prefix=f"{prefix}.experts")
-        # This is a hack. expert_map in FusedMoE isn't moved to GPU by default.
-        # We have to register it explicitly so that it can be moved to GPU with FusedMoE
-        expert_map = self.experts.expert_map
-        del self.experts.expert_map
-        self.experts.register_buffer('expert_map', expert_map)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # print("    mlp", "input", hidden_states.flatten()[:10].cpu())
-        res = self.shared_experts(hidden_states)
-        # print("    mlp", "initial identity", identity.flatten()[:10].cpu())
+    def _setup_experts(self):
+        self.experts = nn.ModuleList(
+            [
+                LLaDA2MoeMLP(config=self.config, intermediate_size=self.config.moe_intermediate_size)
+                for _ in range(self.config.num_experts)
+            ]
+        )
+
+    def forward(self, hidden_states):
+        identity = hidden_states
         bsz, seq_len, h = hidden_states.shape
-        hidden_states_flat = hidden_states.view(-1, h)
-        router_logits = self.gate.get_logits(hidden_states_flat)
-        # print("    mlp", "router_logits", router_logits.flatten()[:10].cpu())
-        y = self.experts.forward_impl(hidden_states=hidden_states_flat,
-                                           router_logits=router_logits)
-        y = y.view(bsz, seq_len, h)
-        # y = hidden_states
-
-        # print("    mlp", "after experts", y.flatten()[:10].cpu())
+        topk_idx, topk_weight, router_logits = self.gate(hidden_states)
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        flat_topk_idx = topk_idx.view(-1)
+        if self.training:
+            hidden_states = hidden_states.repeat_interleave(self.num_experts_per_tok, dim=0)
+            y = torch.empty_like(hidden_states)
+            for i, expert in enumerate(self.experts):
+                y[flat_topk_idx == i] = expert(hidden_states[flat_topk_idx == i])
+            y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            y = y.to(hidden_states.dtype).view(bsz, seq_len, h)
+        else:
+            y = self.moe_infer(hidden_states, topk_idx, topk_weight).view(bsz, seq_len, h)
         if self.config.num_shared_experts is not None:
-            # print('config.num_shared_experts is not None!')
-            # print("    mlp", "shared_experts identity", identity.flatten()[:10].cpu())
-            y = y + res
-            # print("    mlp", "after shared_experts", y.flatten()[:10].cpu())
-        return y
+            y = y + self.shared_experts(identity)
+        return y, (router_logits.view(bsz, seq_len, -1), topk_idx.view(bsz, seq_len, -1))
+
+    @torch.no_grad()
+    def moe_infer(self, x, topk_ids, topk_weight):
+        cnts = topk_ids.new_zeros((topk_ids.shape[0], len(self.experts)))
+        cnts.scatter_(1, topk_ids, 1)
+        tokens_per_expert = cnts.sum(dim=0)
+        idxs = topk_ids.view(-1).argsort()
+        sorted_tokens = x[idxs // topk_ids.shape[1]]
+        sorted_tokens_shape = sorted_tokens.shape
+        tokens_per_expert = tokens_per_expert.cpu().numpy()
+        outputs = []
+        start_idx = 0
+        for i, num_tokens in enumerate(tokens_per_expert):
+            end_idx = start_idx + num_tokens
+            if num_tokens == 0:
+                continue
+            expert = self.experts[i]
+            tokens_for_this_expert = sorted_tokens[start_idx:end_idx]
+            expert_out = expert(tokens_for_this_expert)
+            outputs.append(expert_out.to(x.device))
+            start_idx = end_idx
+
+        outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
+        new_x = torch.empty_like(outs)
+        new_x[idxs] = outs
+        final_out = (
+            new_x.view(*topk_ids.shape, -1)
+            .type(topk_weight.dtype)
+            .mul_(topk_weight.unsqueeze(dim=-1))
+            .sum(dim=1)
+            .type(new_x.dtype)
+        )
+        return final_out
+
 
 # Copied from transformers.models.llama.modeling_llama.repeat_kv
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -682,7 +386,6 @@ class LLaDA2MoeAttention(nn.Module):
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
         self.is_causal = False
-        self.tp_size = 1
 
         self.query_key_value = nn.Linear(
             self.hidden_size,
@@ -690,7 +393,6 @@ class LLaDA2MoeAttention(nn.Module):
             bias=config.use_qkv_bias,
         )
 
-        # if self.config.use_qk_norm:
         self.query_layernorm = LLaDA2MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.key_layernorm = LLaDA2MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.dense = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.use_bias)
@@ -709,6 +411,10 @@ class LLaDA2MoeAttention(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
 
         bsz, q_len, _ = hidden_states.size()
 
@@ -722,13 +428,10 @@ class LLaDA2MoeAttention(nn.Module):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
-        # if self.config.use_qk_norm:
         query_states = self.query_layernorm(query_states)
         key_states = self.key_layernorm(key_states)
 
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
+        kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             if self.layer_idx is None:
                 raise ValueError(
@@ -736,7 +439,12 @@ class LLaDA2MoeAttention(nn.Module):
                     "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
                     "with a layer index."
                 )
-            cache_kwargs = {"sin": sin, "cos": cos}
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -744,13 +452,12 @@ class LLaDA2MoeAttention(nn.Module):
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        kv_seq_len = key_states.shape[-2]
         if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
             raise ValueError(
                 f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
                 f" {attn_weights.size()}"
             )
-
+        # attention_mask = None
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
                 raise ValueError(
@@ -809,6 +516,14 @@ class LLaDA2MoeFlashAttention2(LLaDA2MoeAttention):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         # LLaDA2MoeFlashAttention2 attention does not support output_attentions
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
+
+            # overwrite attention_mask with padding_mask
+            attention_mask = kwargs.pop("padding_mask")
+
         output_attentions = False
 
         bsz, q_len, _ = hidden_states.size()
@@ -827,15 +542,17 @@ class LLaDA2MoeFlashAttention2(LLaDA2MoeAttention):
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
-        # if self.config.use_qk_norm:
         query_states = self.query_layernorm(query_states)
         key_states = self.key_layernorm(key_states)
 
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
-            cache_kwargs = {"sin": sin, "cos": cos}
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         # TODO: These transpose are quite inefficient but Flash Attention requires the layout [batch_size, sequence_length, num_heads, head_dim]. We would need to refactor the KV cache
@@ -915,7 +632,8 @@ class LLaDA2MoeFlashAttention2(LLaDA2MoeAttention):
         else:
             # TODO: Remove the `query_length != 1` check once Flash Attention for RoCm is bumped to 2.1. For details, please see the comment in LLaDA2MoeFlashAttention2 __init__.
             causal = self.is_causal and query_length != 1
-
+        
+        # attention_mask = None
         # Contains at least one padding token in the sequence
         if attention_mask is not None:
             batch_size = query_states.shape[0]
@@ -1004,8 +722,6 @@ class LLaDA2MoeSdpaAttention(LLaDA2MoeAttention):
         output_attentions: bool = False,
         use_cache: bool = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        cache_position: Optional[torch.LongTensor] = None,
-        replace_position= None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if output_attentions:
@@ -1021,60 +737,43 @@ class LLaDA2MoeSdpaAttention(LLaDA2MoeAttention):
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
-                cache_position=cache_position,
-                position_embeddings=position_embeddings,
             )
 
         bsz, q_len, _ = hidden_states.size()
 
-        # vanilla version
-        # qkv = self.query_key_value(hidden_states)
-        # qkv = qkv.view(bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
+        qkv = self.query_key_value(hidden_states)
+        qkv = qkv.view(bsz, q_len, self.num_heads + 2 * self.num_key_value_heads, self.head_dim)
 
-        # query_states, key_states, value_states = qkv.split(
-        #     [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
-        # )
-
-        #tp version
-        qkv = self.query_key_value(hidden_states) 
-        # print("in sdpa ", qkv.shape, self.num_heads, self.num_key_value_heads, self.tp_size, self.num_heads//self.tp_size, self.num_key_value_heads//self.tp_size)
-        qkv = qkv.view(bsz, q_len, self.num_heads//self.tp_size + 2 * self.num_key_value_heads//self.tp_size, self.head_dim)
         query_states, key_states, value_states = qkv.split(
-            [self.num_heads//self.tp_size, self.num_key_value_heads//self.tp_size, self.num_key_value_heads//self.tp_size], dim=-2
+            [self.num_heads, self.num_key_value_heads, self.num_key_value_heads], dim=-2
         )
-        
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
 
-        # if self.config.use_qk_norm:
         query_states = self.query_layernorm(query_states)
         key_states = self.key_layernorm(key_states)
 
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = position_embeddings
-        # print('shape in sdpa:', query_states.shape, key_states.shape, cos.shape, sin.shape)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        # if past_key_value is not None:
-        #     cache_kwargs = {"sin": sin, "cos": cos}
-        #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, replace_position)
-        
-        if use_cache:
-            past_key_value = (key_states, value_states)
+            cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        # attention_mask = None
         if attention_mask is not None:
-            kv_seq_len = key_states.shape[-2]
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-              attention_mask = attention_mask.unsqueeze(1)
-                # raise ValueError(
-                #     f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                # )
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
 
         # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
         # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -1082,8 +781,6 @@ class LLaDA2MoeSdpaAttention(LLaDA2MoeAttention):
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
             value_states = value_states.contiguous()
-
-        attention_mask = attention_mask.bool() if attention_mask is not None else None
 
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
@@ -1110,86 +807,15 @@ ATTENTION_CLASSES = {
 }
 
 
-class LLaDA2MoeMTPLayer(nn.Module):
-    def __init__(self, config: LLaDA2MoeConfig, layer_idx: int):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.input_layernorm = LLaDA2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.enorm = LLaDA2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
-        self.post_attention_layernorm = LLaDA2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attention = ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
-        self.mlp = LLaDA2MoeSparseMoeBlock(config)
-
-        self.hnorm = LLaDA2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.final_layernorm = LLaDA2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        input_embeds,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: Optional[bool] = False,
-        output_router_logits: Optional[bool] = False,
-        use_cache: Optional[bool] = False,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
-        **kwargs,
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
-        input_embeds = self.enorm(input_embeds)
-        hidden_states = self.hnorm(hidden_states)
-        hidden_states = self.eh_proj(torch.cat([input_embeds, hidden_states], dim=-1))
-        residual = hidden_states
-
-        hidden_states = self.input_layernorm(hidden_states)
-
-        # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.attention(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_value=past_key_value,
-            output_attentions=output_attentions,
-            position_embeddings=position_embeddings,
-            use_cache=use_cache,
-        )
-        hidden_states = residual + hidden_states
-
-        # Fully Connected
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        if isinstance(hidden_states, tuple):
-            hidden_states, router_logits = hidden_states
-        else:
-            router_logits = None
-        hidden_states = residual + hidden_states.to(residual.device)
-        hidden_states = self.final_layernorm(hidden_states)
-
-        outputs = (hidden_states,)
-
-        if output_attentions:
-            outputs += (self_attn_weights,)
-
-        if use_cache:
-            outputs += (present_key_value,)
-
-        if output_router_logits:
-            outputs += (router_logits,)
-
-        return outputs
-
-
 class LLaDA2MoeDecoderLayer(nn.Module):
     def __init__(self, config: LLaDA2MoeConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+
         self.attention = ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = (
-            LLaDA2MoeSparseMoeBlock(config, prefix=f"model.layers.{layer_idx}.mlp")
+            LLaDA2MoeSparseMoeBlock(config)
             if (config.num_experts is not None and layer_idx >= config.first_k_dense_replace)
             else LLaDA2MoeMLP(config=config, intermediate_size=config.intermediate_size)
         )
@@ -1201,13 +827,10 @@ class LLaDA2MoeDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        # past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
         use_cache: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        replace_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
@@ -1232,26 +855,23 @@ class LLaDA2MoeDecoderLayer(nn.Module):
                 If set to `True`, `past_key_values` key value states are returned and can be used to speed up decoding
                 (see `past_key_values`).
         """
+        if "padding_mask" in kwargs:
+            warnings.warn(
+                "Passing `padding_mask` is deprecated and will be removed in v4.37. Please make sure use `attention_mask` instead.`"
+            )
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        # print(hidden_states.shape)
-        # print("attn_mask")
-        # print(attention_mask.shape)
-        # print("position_ids")
-        # print(position_ids.shape)
         hidden_states, self_attn_weights, present_key_value = self.attention(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
-            use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
-            replace_position=replace_position,
+            use_cache=use_cache,
         )
         hidden_states = residual + hidden_states
 
@@ -1279,7 +899,7 @@ class LLaDA2MoeDecoderLayer(nn.Module):
         return outputs
 
 
-LLaDA2Moe_START_DOCSTRING = r"""
+LLADA2MOE_START_DOCSTRING = r"""
     This model inherits from [`PreTrainedModel`]. Check the superclass documentation for the generic methods the
     library implements for all its model (such as downloading or saving, resizing the input embeddings, pruning heads
     etc.)
@@ -1298,7 +918,7 @@ LLaDA2Moe_START_DOCSTRING = r"""
 
 @add_start_docstrings(
     "The bare LLaDA2Moe Model outputting raw hidden-states without any specific head on top.",
-    LLaDA2Moe_START_DOCSTRING,
+    LLADA2MOE_START_DOCSTRING,
 )
 class LLaDA2MoePreTrainedModel(PreTrainedModel):
     config_class = LLaDA2MoeConfig
@@ -1322,7 +942,7 @@ class LLaDA2MoePreTrainedModel(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
 
-LLaDA2Moe_INPUTS_DOCSTRING = r"""
+LLADA2MOE_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
@@ -1394,7 +1014,7 @@ LLaDA2Moe_INPUTS_DOCSTRING = r"""
 
 @add_start_docstrings(
     "The bare LLaDA2Moe Model outputting raw hidden-states without any specific head on top.",
-    LLaDA2Moe_START_DOCSTRING,
+    LLADA2MOE_START_DOCSTRING,
 )
 class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
     """
@@ -1408,16 +1028,11 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.num_nextn_predict_layers = 0
 
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = []
-        for layer_idx in range(config.num_hidden_layers + self.num_nextn_predict_layers):
-            layer_cls = LLaDA2MoeDecoderLayer if layer_idx < config.num_hidden_layers else LLaDA2MoeMTPLayer
-            self.layers.append(layer_cls(config, layer_idx))
-
-        self.layers = nn.ModuleList(self.layers)
-
+        self.layers = nn.ModuleList(
+            [LLaDA2MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
         self._use_sdpa = config._attn_implementation == "sdpa"
         self._use_flash_attention_2 = config._attn_implementation == "flash_attention_2"
         self.norm = LLaDA2MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1432,24 +1047,21 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
     def set_input_embeddings(self, value):
         self.word_embeddings = value
 
-    @add_start_docstrings_to_model_forward(LLaDA2Moe_INPUTS_DOCSTRING)
+    @add_start_docstrings_to_model_forward(LLADA2MOE_INPUTS_DOCSTRING)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        # past_key_values: Optional[List[torch.FloatTensor]] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None, # add extra cache_position / replace position for dInfer kvcache managerment
-        replace_position: Optional[torch.LongTensor] = None,
         **kwargs,
-    ) -> Union[Tuple, MoeV2ModelOutputWithPast]:
+    ) -> Union[Tuple, MoeModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1478,45 +1090,41 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                 )
                 use_cache = False
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+        past_key_values_length = 0
+        if use_cache:
+            use_legacy_cache = not isinstance(past_key_values, Cache)
+            if use_legacy_cache:
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+            past_key_values_length = past_key_values.get_usable_length(seq_length)
+
+        if position_ids is None:
+            device = input_ids.device if input_ids is not None else inputs_embeds.device
+            position_ids = torch.arange(
+                past_key_values_length, seq_length + past_key_values_length, dtype=torch.long, device=device
+            )
+            position_ids = position_ids.unsqueeze(0)
 
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
 
-        # past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-
-        # if position_ids is None:
-            # position_ids = torch.arange(
-            #     past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-            # )
-            # position_ids = position_ids.unsqueeze(0)
-        
-        # 
-        if position_ids is None:
-            if replace_position is not None:
-                position_ids = torch.arange(replace_position[0], replace_position[1], device=inputs_embeds.device, dtype=torch.long).unsqueeze(0)
-            else:
-                position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device, dtype=torch.long).unsqueeze(0)
-
-
+        # TODO flash attention 2 can not support custom attention mask
         # if self._use_flash_attention_2:
         #     # 2d mask is passed through the layers
         #     attention_mask = attention_mask if (attention_mask is not None and 0 in attention_mask) else None
-        # elif self._use_sdpa and not output_attentions:
-        #     # output_attentions=True can not be supported when using SDPA, and we fall back on
-        #     # the manual implementation that requires a 4D causal mask in all cases.
-        #     attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-        #         attention_mask,
-        #         (batch_size, seq_length),
-        #         inputs_embeds,
-        #         past_seen_tokens,
-        #     )
-        # else:
-        #     # 4d mask is passed through the layers
-        #     attention_mask = _prepare_4d_causal_attention_mask(
-        #         attention_mask, (batch_size, seq_length), inputs_embeds, past_seen_tokens
-        #     )
+        if self._use_sdpa and not output_attentions:
+            # output_attentions=True can not be supported when using SDPA, and we fall back on
+            # the manual implementation that requires a 4D causal mask in all cases.
+            attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
+                attention_mask,
+                (batch_size, seq_length),
+                inputs_embeds,
+                past_key_values_length,
+            )
+        else:
+            # 4d mask is passed through the layers
+            attention_mask = _prepare_4d_causal_attention_mask(
+                attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
+            )
 
         # embed positions
         hidden_states = inputs_embeds
@@ -1528,12 +1136,9 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
-        # next_decoder_cache = None
-        next_decoder_cache = []
-        layers = self.layers[: -self.num_nextn_predict_layers] if self.num_nextn_predict_layers > 0 else self.layers
-        mtp_layers = self.layers[-self.num_nextn_predict_layers :] if self.num_nextn_predict_layers > 0 else None
+        next_decoder_cache = None
 
-        for decoder_layer in layers:
+        for decoder_layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
@@ -1559,16 +1164,11 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                     output_router_logits=output_router_logits,
                     use_cache=use_cache,
                     position_embeddings=position_embeddings,
-                    cache_position=cache_position, # add 2 extra cache args
-                    replace_position=replace_position,
-
                 )
             hidden_states = layer_outputs[0]
 
             if use_cache:
-                # next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-                next_decoder_cache.extend(layer_outputs[2 if output_attentions else 1])
-
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
 
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
@@ -1577,77 +1177,24 @@ class LLaDA2MoeModel(LLaDA2MoePreTrainedModel):
                 all_router_logits += (layer_outputs[-1],)
 
         hidden_states = self.norm(hidden_states)
-        main_hidden_states = hidden_states
 
         # add hidden states from the last decoder layer
         if output_hidden_states:
-            all_hidden_states += (main_hidden_states,)
-
-
-        mtp_hidden_states = None
-
-        if mtp_layers:
-            for decoder_layer in mtp_layers:
-                input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
-                inputs_embeds = self.word_embeddings(input_ids)
-
-                if self.gradient_checkpointing and self.training:
-                    layer_outputs = self._gradient_checkpointing_func(
-                        decoder_layer.__call__,
-                        inputs_embeds,
-                        hidden_states,
-                        attention_mask,
-                        position_ids,
-                        past_key_values,
-                        output_attentions,
-                        output_router_logits,
-                        use_cache,
-                        position_embeddings,
-                    )
-                else:
-                    layer_outputs = decoder_layer(
-                        inputs_embeds,
-                        hidden_states,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_values,
-                        output_attentions=output_attentions,
-                        output_router_logits=output_router_logits,
-                        use_cache=use_cache,
-                        position_embeddings=position_embeddings,
-                    )
-                if mtp_hidden_states is None:
-                    mtp_hidden_states = []
-                hidden_states = layer_outputs[0]
-                mtp_hidden_states.append(hidden_states)
-
-                if output_hidden_states:
-                    all_hidden_states += (hidden_states,)
-
-                if use_cache:
-                    next_decoder_cache = layer_outputs[2 if output_attentions else 1]
-
-                if output_attentions:
-                    all_self_attns += (layer_outputs[1],)
-
-                if output_router_logits and layer_outputs[-1] is not None:
-                    all_router_logits += (layer_outputs[-1],)
+            all_hidden_states += (hidden_states,)
 
         next_cache = None
         if use_cache:
-            next_cache = next_decoder_cache
-
+            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache
         if not return_dict:
             return tuple(
                 v
-                for v in [main_hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
+                for v in [hidden_states, next_cache, all_hidden_states, all_self_attns, all_router_logits]
                 if v is not None
             )
-        return MoeV2ModelOutputWithPast(
-            last_hidden_state=main_hidden_states,
+        return MoeModelOutputWithPast(
+            last_hidden_state=hidden_states,
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
-            mtp_hidden_states=mtp_hidden_states,
             attentions=all_self_attns,
             router_logits=all_router_logits,
         )
@@ -1661,19 +1208,9 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         self.model = LLaDA2MoeModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.num_nextn_predict_layers = 0
-        self.mtp_loss_scaling_factor = 0
 
-        # # Initialize weights and apply final processing
-        # self.post_init()
         # Initialize weights and apply final processing
-        self._tp_size = 1
         self.post_init()
-        self._tp_plan = {
-            "layers.*.attention.query_key_value": "qkv",
-            "layers.*.attention.dense": "rowwise",
-        }
-        self.init_h2e_module()
 
     def get_input_embeddings(self):
         return self.model.word_embeddings
@@ -1692,178 +1229,15 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
-        
-    def load_state_dict(self, model_dir, strict=True, dtype=torch.bfloat16, device=None):
-        num_experts = self.config.num_experts
-        moe_intermediate_size = self.config.moe_intermediate_size
-        num_layers = self.config.num_hidden_layers
-        ep_rank = get_tensor_model_parallel_rank()
-        ep_size = get_tensor_model_parallel_world_size()
-        expert_start = ep_rank * num_experts // ep_size
-        expert_end = (ep_rank + 1) * num_experts // ep_size
-        index_path = Path(model_dir) / "model.safetensors.index.json"
-        with open(index_path, "r") as f:
-            index = json.load(f)
 
-        weight_map = index["weight_map"]
-        shard_files = {v for v in weight_map.values()}
-
-        state_dict = {}
-        # print(shard_files)
-        for shard in tqdm.tqdm(sorted(shard_files)):
-            shard_path = Path(model_dir) / shard
-            if not shard_path.exists():
-                raise FileNotFoundError(f"Missing shard: {shard_path}")
-            
-            with torch.inference_mode():
-                file_state_dict = load_file(str(shard_path))
-                filtered_file_state_dict = {}
-                for key, value in file_state_dict.items():
-                    if ".mlp.experts." in key:
-                        layer_id = int(key.split(".mlp.experts.")[0].split(".")[-1])
-                        expert_id = int(key.split(".mlp.experts.")[1].split(".")[0])
-                        if expert_start <= expert_id < expert_end:
-                            filtered_file_state_dict[key] = value
-                    else:
-                        filtered_file_state_dict[key] = value
-                            
-                        
-                state_dict.update(filtered_file_state_dict)
-
-        new_state_dict = {}
-        gate_projs = [{} for _ in range(num_layers)]
-        up_projs = [{} for _ in range(num_layers)]
-        down_projs = [{} for _ in range(num_layers)]
-        for key, value in tqdm.tqdm(state_dict.items()):
-            if ".mlp.experts." in key:
-                layer_id = int(key.split(".mlp.experts.")[0].split(".")[-1])
-                expert_id = int(key.split(".mlp.experts.")[1].split(".")[0])
-                if layer_id < num_layers:
-                    if "gate_proj" in key:
-                        gate_projs[layer_id][expert_id-expert_start] = value
-                    elif "up_proj" in key:
-                        up_projs[layer_id][expert_id-expert_start] = value
-                    elif "down_proj" in key:
-                        down_projs[layer_id][expert_id-expert_start] = value
-            else:
-                new_state_dict[key] = value
-
-        del state_dict
-        for layer_id in tqdm.trange(num_layers):
-            if f"model.layers.{layer_id}.mlp.w1" in new_state_dict.keys():
-                ep_rank = get_tensor_model_parallel_rank()
-                ep_size = get_tensor_model_parallel_world_size()
-                size = divide(new_state_dict[f"model.layers.{layer_id}.mlp.w1"].shape[0], ep_size)
-                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = new_state_dict[f"model.layers.{layer_id}.mlp.w1"][ep_rank*size:(ep_rank+1)*size]
-                new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = new_state_dict[f"model.layers.{layer_id}.mlp.w2"][ep_rank*size:(ep_rank+1)*size]
-                del new_state_dict[f"model.layers.{layer_id}.mlp.w1"]
-                del new_state_dict[f"model.layers.{layer_id}.mlp.w2"]
-            else:
-                w13_weight = []
-                w2_weight = []
-                if 0 in gate_projs[layer_id].keys():
-                    for expert_id in range(num_experts//ep_size):
-                        gate_proj = gate_projs[layer_id][expert_id].to(device)
-                        up_proj = up_projs[layer_id][expert_id].to(device)
-                        down_proj = down_projs[layer_id][expert_id].to(device)
-                        w13_weight.append(torch.cat([gate_proj, up_proj], dim=0))
-                        w2_weight.append(down_proj)
-                    w13_weight = torch.stack(w13_weight, dim=0)
-                    w2_weight = torch.stack(w2_weight, dim=0)
-                    new_state_dict[f"model.layers.{layer_id}.mlp.experts.w13_weight"] = w13_weight.contiguous().to(device)
-                    new_state_dict[f"model.layers.{layer_id}.mlp.experts.w2_weight"] = w2_weight.contiguous().to(device)
-                    del w13_weight, w2_weight
-
-
-        # print("====new_state_dict")
-        # for key, value in new_state_dict.items():
-        #     # if int(key.split(".")[3])<num_layers:
-        #     print(key, value.shape, value.dtype)
-
-        # print("====self.state_dict")
-        # for key, value in self.state_dict().items():
-        #     print(key, value.shape, value.dtype)
-
-        new_state_dict_keys = new_state_dict.keys()
-        self_state_dict_keys = self.state_dict().keys()
-        
-        unused_keys = []
-        for key in new_state_dict_keys:
-            if key not in self_state_dict_keys:
-                unused_keys.append(key)
-
-        not_inited_keys = []
-        for key in self_state_dict_keys:
-            if key not in new_state_dict_keys:
-                not_inited_keys.append(key) 
-
-        print("unused_keys", unused_keys)    
-        print("not_inited_keys", not_inited_keys)    
-        
-        
-
-        # 调用父类方法加载
-        # super().load_state_dict(new_state_dict, strict=strict)
-        for key, value in tqdm.tqdm(new_state_dict.items()):
-            new_state_dict[key] = value.to(device)
-        params_dict = dict(self.named_parameters())
-        buffer_dict = dict(self.named_buffers())
-        for name, loaded_weight in new_state_dict.items():
-            if name in params_dict:
-                param = params_dict[name]
-                param.data = loaded_weight
-            elif name in buffer_dict:
-                buffer = buffer_dict[name]
-                buffer.data = loaded_weight
-            else:
-                print('params not matching:', name)
-        # super().load_state_dict(new_state_dict, strict=strict)
-        for name, param in self.named_parameters():
-            if '.mlp.gate.expert_bias' in name:
-                param.data = param.data.to(torch.float32)
-            else:
-                param.data = param.data.to(dtype)
-    
-            
-
-
-    def load_sharded_safetensors(self, model_dir):
-        index_path = Path(model_dir) / "model.safetensors.index.json"
-        with open(index_path, "r") as f:
-            index = json.load(f)
-
-        weight_map = index["weight_map"]
-        shard_files = {v for v in weight_map.values()}
-
-        state_dict = {}
-        for shard in sorted(shard_files):  
-            shard_path = Path(model_dir) / shard
-            if not shard_path.exists():
-                raise FileNotFoundError(f"Missing shard: {shard_path}")
-            
-            with torch.inference_mode():
-                state_dict.update(load_file(str(shard_path)))
-
-        return state_dict
-
-    def init_h2e_module(self):
-        self.h2e = H2Embed(self.model.word_embeddings, tau=1.0)
-
-    def load_weights(self, model_path, torch_dtype = torch.bfloat16, device=None):
-        self.load_state_dict(model_path, strict=False, dtype=torch_dtype, device=device)
-        self.init_h2e_module()
-
-
-    @add_start_docstrings_to_model_forward(LLaDA2Moe_INPUTS_DOCSTRING)
-    @replace_return_docstrings(output_type=MoEV2CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
+    @add_start_docstrings_to_model_forward(LLADA2MOE_INPUTS_DOCSTRING)
+    @replace_return_docstrings(output_type=MoeCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        replace_position: Optional[torch.LongTensor] = None,
-        # past_key_values: Optional[List[torch.FloatTensor]] = None,
-        past_key_values: Optional[KVCache] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
@@ -1871,9 +1245,8 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        num_logits_to_keep: int = 0,
         **kwargs,
-    ) -> Union[Tuple, MoEV2CausalLMOutputWithPast]:
+    ) -> Union[Tuple, MoeCausalLMOutputWithPast]:
         r"""
         Args:
             labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1907,8 +1280,7 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-        # decoder outputs consists`` of (dec_features, layer_state, dec_hidden, dec_attn)
-
+        # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1920,44 +1292,28 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
             return_dict=return_dict,
-            replace_position=replace_position,
             **kwargs,
         )
 
-        loss = None
-        all_mtp_loss = None
-        aux_loss = None
         hidden_states = outputs[0]
+
         logits = self.lm_head(hidden_states)
         logits = logits.float()
 
+        loss = None
+        aux_loss = None
+
         if labels is not None:
-            loss = self.loss_function(logits, labels, self.config.vocab_size, **kwargs)
-
-        all_mtp_logits = None
-        if self.num_nextn_predict_layers > 0:
-            mtp_hidden_states = outputs.mtp_hidden_states
-            shift_labels_mtp = None
-            for i in range(self.num_nextn_predict_layers):
-                mtp_hidden_states = mtp_hidden_states[i]
-                mtp_logits = self.lm_head(mtp_hidden_states).float()
-                if all_mtp_logits is None:
-                    all_mtp_logits = []
-                all_mtp_logits.append(mtp_logits)
-                if labels is not None:
-                    if shift_labels_mtp is None:
-                        shift_labels_mtp = labels.clone()
-                    shift_labels_mtp, _ = roll_tensor(shift_labels_mtp, shifts=-1, dims=-1, fill_value=-100)
-                    mtp_logits_ = mtp_logits.view(-1, self.config.vocab_size)
-                    mtp_loss = self.loss_function(mtp_logits_, shift_labels_mtp.to(mtp_logits_.device).view(-1), self.config.vocab_size, **kwargs)
-                    if loss is not None:
-                        loss += self.mtp_loss_scaling_factor * mtp_loss
-                    else:
-                        loss = self.mtp_loss_scaling_factor * mtp_loss
-
-                    if all_mtp_loss is None:
-                        all_mtp_loss = []
-                    all_mtp_loss.append(mtp_loss)
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            loss = loss_fct(shift_logits, shift_labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1965,50 +1321,309 @@ class LLaDA2MoeModelLM(LLaDA2MoePreTrainedModel, GenerationMixin):
                 output = (aux_loss,) + output
             return (loss,) + output if loss is not None else output
 
-        past_key_values = KVCache(outputs.past_key_values) if outputs.past_key_values is not None else None
-
-        return MoEV2CausalLMOutputWithPast(
+        return MoeCausalLMOutputWithPast(
             loss=loss,
-            mtp_loss=all_mtp_loss,
             aux_loss=aux_loss,
             logits=logits,
-            mtp_logits=all_mtp_logits,
-            # past_key_values=outputs.past_key_values,
-            past_key_values=past_key_values,
+            past_key_values=outputs.past_key_values,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
             router_logits=outputs.router_logits,
         )
-    def tensor_parallel(self, tp_size):
-        """
-        Apply the model's tensor parallelization plan.
-        Currently only supports linear layers.
-        """
-        tp_plan = self._tp_plan
-        self._tp_size = tp_size
 
-        def _tensor_parallel(module: nn.Module, prefix: str = ""):
-            for child_name, child_module in module.named_children():
-                qual_name = maybe_prefix(prefix, child_name)
-                # print(qual_name)
-                for pattern, style in tp_plan.items():
-                    if re.match(pattern, qual_name) and isinstance(
-                            child_module, nn.Linear):
-                        new_module = replace_linear_class(
-                            child_module, style, None, self.config)
-                        dtype = child_module.weight.dtype
-                        new_module.weight_loader(new_module.weight, child_module.weight)
-                        new_module.weight.data = new_module.weight.data.to(dtype)
-                        setattr(module, child_name, new_module)
-                        break
-                    else:
-                        _tensor_parallel(child_module, prefix=qual_name)
-                if '.attention' in qual_name and len(qual_name.split('.'))==3:
-                    child_module.tp_size = tp_size
-            self.h2e.sp_size = tp_size
-                # if qual_name == "transformer.ff_out":
-                #     new_module = ColumnParallelLinear(child_module.in_features, child_module.out_features, False, True, return_bias=False)
-                #     new_module.weight_loader(new_module.weight, child_module.weight)
-                #     setattr(module, child_name, new_module)
-                    
-        _tensor_parallel(self.model)
+    def prepare_inputs_for_generation(
+        self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, token_type_ids=None, **kwargs
+    ):
+        if past_key_values is not None:
+            if isinstance(past_key_values, Cache):
+                cache_length = past_key_values.get_seq_length()
+                past_length = past_key_values.seen_tokens
+                max_cache_length = (
+                    past_key_values.get_max_length()
+                    if hasattr(past_key_values, "get_max_length")
+                    else past_key_values.get_max_cache_shape()
+                )
+            else:
+                cache_length = past_length = past_key_values[0][0].shape[2]
+                max_cache_length = None
+
+            # Keep only the unprocessed tokens:
+            # 1 - If the length of the attention_mask exceeds the length of input_ids, then we are in a setting where
+            # some of the inputs are exclusivelly passed as part of the cache (e.g. when passing input_embeds as input)
+            if attention_mask is not None and attention_mask.shape[1] > input_ids.shape[1]:
+                input_ids = input_ids[:, -(attention_mask.shape[1] - past_length) :]
+            # 2 - If the past_length is smaller than input_ids', then input_ids holds all input tokens. We can discard
+            # input_ids based on the past_length.
+            elif past_length < input_ids.shape[1]:
+                input_ids = input_ids[:, past_length:]
+            # 3 - Otherwise (past_length >= input_ids.shape[1]), let's assume input_ids only has unprocessed tokens.
+
+            # If we are about to go beyond the maximum cache length, we need to crop the input attention mask.
+            if (
+                max_cache_length is not None
+                and attention_mask is not None
+                and cache_length + input_ids.shape[1] > max_cache_length
+            ):
+                attention_mask = attention_mask[:, -max_cache_length:]
+
+        position_ids = kwargs.get("position_ids", None)
+        if attention_mask is not None and position_ids is None:
+            # create position_ids on the fly for batch generation
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            if past_key_values:
+                position_ids = position_ids[:, -input_ids.shape[1] :]
+
+        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"inputs_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+
+        model_inputs.update(
+            {
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": kwargs.get("use_cache"),
+                "attention_mask": attention_mask,
+            }
+        )
+        return model_inputs
+
+    @staticmethod
+    def _reorder_cache(past_key_values, beam_idx):
+        reordered_past = ()
+        for layer_past in past_key_values:
+            reordered_past += (
+                tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past),
+            )
+        return reordered_past
+
+    @staticmethod
+    def _top_k_logits(logits, k):
+        if k is None or k <= 0:
+            return logits
+        else:
+            values, _ = torch.topk(logits, k)
+            min_values = values[..., -1, None]
+            return torch.where(
+                logits < min_values, torch.full_like(logits, float("-inf")), logits
+            )
+
+    @staticmethod
+    def _top_p_logits(logits, p):
+        if p is None or p >= 1.0:
+            return logits
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_mask = cumulative_probs > p
+        sorted_mask[..., 1:] = sorted_mask[..., :-1].clone()
+        sorted_mask[..., 0] = False
+        mask_indices = torch.scatter(
+            torch.full_like(logits, False, dtype=torch.bool),
+            -1,
+            sorted_indices,
+            sorted_mask,
+        )
+        return logits.masked_fill(mask_indices, float("-inf"))
+
+    def _sample_with_temperature_topk_topp(self, logits, temperature=1.0, top_k=0, top_p=1.0):
+        orig_shape = logits.shape[:-1]
+        vocab_size = logits.shape[-1]
+        logits = logits.reshape(-1, vocab_size)
+        
+        # Greedy mode: temperature = 0, no top-k/p
+        if temperature == 0.0 and (top_k in (None, 0)) and (top_p is None or top_p >= 1.0):
+            probs = F.softmax(logits, dim=-1)
+            token = logits.argmax(dim=-1, keepdim=True)
+            token_prob = probs.gather(-1, token)
+            return token.view(*orig_shape), token_prob.view(*orig_shape)
+        
+        if temperature > 0 and temperature != 1.0:
+            logits = logits / temperature
+        logits = self._top_k_logits(logits, top_k)
+        logits = self._top_p_logits(logits, top_p)
+        probs = F.softmax(logits, dim=-1)
+        token = torch.multinomial(probs, num_samples=1)
+        token_prob = torch.gather(probs, -1, token)
+        return token.view(*orig_shape), token_prob.view(*orig_shape)
+
+    @staticmethod
+    def _get_num_transfer_tokens(block_length, steps):
+        if steps == 0:
+            return torch.tensor([], dtype=torch.int64)
+        base = block_length // steps
+        remainder = block_length % steps
+        num_transfer_tokens = torch.full((steps,), base, dtype=torch.int64)
+        num_transfer_tokens[:remainder] += 1
+        return num_transfer_tokens
+
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        temperature: int = 0.0,
+        block_length: int = 32,
+        steps: int = 32,
+        gen_length: int = 2048,
+        top_p: Optional[int] = None,
+        top_k: Optional[int] = None,
+        eos_early_stop: bool = False,
+        minimal_topk: int = 1,
+        threshold: float = 0.95,
+        eos_id: int = 156892,
+        mask_id: int = 156895,
+    ):
+        r"""
+        Generates tokens using a block-wise, iterative refinement strategy.
+
+        This method operates differently from standard autoregressive generation. It first creates a template of the
+        full desired length, filled with a special `mask_id`. It then processes this template in segments (`blocks`)
+        and iteratively "denoises" or "refines" the `mask_id` tokens into actual tokens over a series of `steps` for
+        each block. A custom block-diagonal causal attention mask ensures that generation within a block can attend to
+        all previous blocks but not future ones.
+
+        <Tip warning={true}>
+
+        This is a specialized generation method. The quality and speed of the output are highly dependent on the interplay
+        between `block_length`, `steps`, and `threshold`. It aims to achieve faster generation through parallel
+        decoding within blocks, which is a departure from the token-by-token generation of standard `.generate()` methods.
+
+        </Tip>
+
+        Parameters:
+            inputs (`torch.Tensor`):
+                The token sequence used as a prompt for the generation.
+            temperature (`float`, *optional*, defaults to 0.0):
+                The value used to module the next token probabilities. A value of 0.0 corresponds to greedy decoding.
+            block_length (`int`, *optional*, defaults to 32):
+                The size of each generation block. The model generates text in parallel within these blocks. This is a
+                key parameter for controlling the granularity of the generation process.
+            steps (`int`, *optional*, defaults to 32):
+                The number of iterative refinement (or "denoising") steps to perform for each block. Within each block,
+                the model will try to replace `mask_id` tokens with real tokens for this many iterations.
+            gen_length (`int`, *optional*, defaults to 2048):
+                The maximum number of tokens to generate, excluding the prompt.
+            top_p (`float`, *optional*):
+                If set to a float value between 0 and 1, only the most probable tokens with probabilities that add up to
+                `top_p` or higher are kept for generation (nucleus sampling).
+            top_k (`int`, *optional*):
+                The number of highest probability vocabulary tokens to keep for top-k-filtering.
+            eos_early_stop (`bool`, *optional*, defaults to `False`):
+                If `True`, generation will stop as soon as a valid End-Of-Sequence token is generated and confirmed,
+                even if `gen_length` has not been reached.
+            minimal_topk (`int`, *optional*, defaults to 1):
+                A parameter used to dynamically adjust the number of refinement `steps`. The effective number of steps
+                is capped at `gen_length // minimal_topk`.
+            threshold (`float`, *optional*, defaults to 0.95):
+                The confidence probability threshold for accepting a sampled token. During each refinement step, a
+                sampled token is only kept if its probability is above this threshold. If not enough tokens meet the
+                threshold, the ones with the highest confidence are chosen.
+            eos_id (`int`, *optional*, defaults to 156892):
+                The token ID for the end-of-sequence token. Used for `eos_early_stop`.
+            mask_id (`int`, *optional*, defaults to 156895):
+                The token ID used as a placeholder for tokens that are yet to be generated. This is central to the
+                iterative refinement algorithm.
+
+        Return:
+            `torch.Tensor`: A string containing the generated token IDs, starting
+            after the prompt and stopping at the first `eos_id` or `gen_length`.
+        """
+        steps = min(steps, gen_length // minimal_topk)
+        input_ids = inputs.to(self.device)
+
+        prompt_length = input_ids.shape[1]
+        num_blocks = (prompt_length + gen_length + block_length - 1) // block_length
+        total_length = num_blocks * block_length
+
+        block_mask = torch.tril(torch.ones(num_blocks, num_blocks, device=self.device))
+        block_diffusion_attention_mask = (
+            block_mask.repeat_interleave(block_length, dim=0)
+            .repeat_interleave(block_length, dim=1)
+            .unsqueeze(0)
+            .unsqueeze(0)
+        ).bool()
+        block_diffusion_attention_mask = torch.where(
+            block_diffusion_attention_mask, 0.0, float("-inf")
+        ).to(torch.bfloat16)
+
+        position_ids = torch.arange(total_length, device=self.device).unsqueeze(0)
+        x = torch.full((1, total_length), mask_id, dtype=torch.long, device=self.device)
+        x[:, :prompt_length] = input_ids.clone()
+
+        prompt_index_full = torch.zeros_like(x, dtype=torch.bool)
+        prompt_index_full[:, :prompt_length] = True
+
+        prefill_blocks = prompt_length // block_length
+
+        denoising_steps_per_block = steps
+        num_transfer_tokens_schedule = self._get_num_transfer_tokens(
+            block_length, denoising_steps_per_block
+        )
+        for num_block in range(prefill_blocks, num_blocks):
+            current_window_end = (num_block + 1) * block_length
+            cur_x = x[:, :current_window_end]
+            cur_attn_mask = block_diffusion_attention_mask[
+                :, :, :current_window_end, :current_window_end
+            ]
+            cur_position_ids = position_ids[:, :current_window_end]
+
+            for step in range(denoising_steps_per_block):
+                active_block_mask = cur_x[:, -block_length:] == mask_id
+                if active_block_mask.sum() == 0:
+                    break
+
+                logits = self.forward(
+                    cur_x,
+                    attention_mask=cur_attn_mask,
+                    position_ids=cur_position_ids,
+                ).logits
+
+                active_logits = logits[:, -block_length:, :]
+                x0, x0_p = self._sample_with_temperature_topk_topp(
+                    active_logits, temperature=temperature, top_k=top_k, top_p=top_p
+                )
+
+                num_to_transfer = num_transfer_tokens_schedule[step].item()
+                transfer_index = torch.zeros_like(x0, dtype=torch.bool)
+
+                confidence = torch.where(active_block_mask, x0_p, -torch.inf)
+                high_conf_mask = confidence[0] > threshold
+                num_high_confidence = high_conf_mask.sum().item()
+
+                if num_high_confidence >= num_to_transfer:
+                    transfer_index[0] = high_conf_mask
+                else:
+                    _, idx = torch.topk(
+                        confidence[0],
+                        k=min(num_to_transfer, active_block_mask.sum().item()),
+                    )
+                    transfer_index[0, idx] = True
+
+                if transfer_index.any():
+                    cur_x[:, -block_length:][transfer_index] = x0[transfer_index]
+                if eos_early_stop and (x0[transfer_index] == eos_id).any():
+                    eos_pos_in_x = (cur_x[0] == eos_id).nonzero(as_tuple=True)
+                    if len(eos_pos_in_x[0]) > 0:
+                        eos_pos = eos_pos_in_x[0][0].item()
+                        if (cur_x[0, prompt_length:eos_pos] != mask_id).all():
+                            final_x = x[:, :total_length][:, : eos_pos + 1]
+                            return final_x
+
+            x[:, :current_window_end] = cur_x
+            if (
+                eos_id is not None
+                and (x[0, prompt_length:current_window_end] == eos_id).any()
+            ):
+                break
+
+        generated_answer = x[:, : prompt_length + gen_length]
+
+        mask_positions = (generated_answer[0][input_ids.shape[1] :] == eos_id).nonzero(
+            as_tuple=True
+        )[0]
+        if len(mask_positions) > 0:
+            first_mask_position = mask_positions[0].item()
+        else:
+            first_mask_position = gen_length
+        return generated_answer[:, : input_ids.shape[1] + first_mask_position + 1]
