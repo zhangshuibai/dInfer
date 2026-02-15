@@ -107,7 +107,190 @@ def expert_choice_routing(
     )
 
 
-# ================================ Triton Kernels ================================
+# ================================ Fused Routing Kernel ================================
+
+@triton.jit
+def _fused_softmax_topk_kernel(
+    # Inputs
+    gating_ptr,          # [N, E] router logits
+    # Outputs
+    expert_tokens_ptr,   # [E, C] token indices
+    expert_weights_ptr,  # [E, C] weights
+    # Dims
+    N: tl.constexpr,
+    C: tl.constexpr,
+    # Strides
+    stride_g_n, stride_g_e,
+    stride_et_e, stride_et_c,
+    stride_ew_e, stride_ew_c,
+    # Block
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Fused softmax(dim=0) + top-C selection for expert choice routing.
+    One program per expert. Replaces: softmax → transpose → topk (3 kernel launches → 1).
+    """
+    pid_e = tl.program_id(0)
+
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N
+
+    # Load gating column for this expert: gating_output[:, e]
+    g_ptrs = gating_ptr + offs_n * stride_g_n + pid_e * stride_g_e
+    vals = tl.load(g_ptrs, mask=mask_n, other=float('-inf')).to(tl.float32)
+
+    # Softmax over tokens (dim=0)
+    max_val = tl.max(vals, axis=0)
+    exp_vals = tl.exp(vals - max_val)
+    exp_vals = tl.where(mask_n, exp_vals, 0.0)
+    sum_val = tl.sum(exp_vals, axis=0)
+    scores = exp_vals / sum_val
+
+    # Iterative top-C: find max, store, mask out
+    for _i in range(C):
+        cur_max = tl.max(scores, axis=0)
+        is_max = (scores == cur_max) & mask_n
+        cand = tl.where(is_max, offs_n, N)
+        idx = tl.min(cand, axis=0)
+
+        tl.store(
+            expert_tokens_ptr + pid_e * stride_et_e + _i * stride_et_c,
+            idx.to(tl.int32),
+        )
+        tl.store(
+            expert_weights_ptr + pid_e * stride_ew_e + _i * stride_ew_c,
+            cur_max,
+        )
+        scores = tl.where(offs_n == idx, -1.0, scores)
+
+
+def expert_choice_routing_fused(
+    gating_output: torch.Tensor,
+    capacity: int,
+    renormalize: bool = True,
+) -> ExpertChoiceRoutingOutput:
+    """
+    Fused expert choice routing: softmax + topk in a single Triton kernel.
+    Drop-in replacement for expert_choice_routing().
+    """
+    num_tokens, num_experts = gating_output.shape
+    device = gating_output.device
+    actual_capacity = min(capacity, num_tokens)
+
+    expert_tokens = torch.empty((num_experts, actual_capacity), device=device, dtype=torch.int32)
+    expert_weights = torch.empty((num_experts, actual_capacity), device=device, dtype=torch.float32)
+
+    BLOCK_N = triton.next_power_of_2(num_tokens)
+
+    _fused_softmax_topk_kernel[(num_experts,)](
+        gating_output,
+        expert_tokens,
+        expert_weights,
+        num_tokens,
+        actual_capacity,
+        gating_output.stride(0), gating_output.stride(1),
+        expert_tokens.stride(0), expert_tokens.stride(1),
+        expert_weights.stride(0), expert_weights.stride(1),
+        BLOCK_N=BLOCK_N,
+    )
+
+    if renormalize:
+        token_weight_sum = torch.zeros(num_tokens, device=device, dtype=torch.float32)
+        token_weight_sum.scatter_add_(
+            0,
+            expert_tokens.flatten().long(),
+            expert_weights.flatten(),
+        )
+        token_weight_sum = torch.clamp(token_weight_sum, min=1e-6)
+        expert_weights = expert_weights / token_weight_sum[expert_tokens.long()]
+
+    return ExpertChoiceRoutingOutput(
+        expert_tokens=expert_tokens,
+        expert_weights=expert_weights,
+        num_experts=num_experts,
+        capacity=actual_capacity,
+    )
+
+
+# ================================ Fused Scatter Kernel ================================
+
+@triton.jit
+def _fused_scatter_add_kernel(
+    # Inputs
+    src_ptr,         # [total, D] source (flattened expert output)
+    indices_ptr,     # [total] token indices (int32)
+    # Output
+    dst_ptr,         # [N, D] destination (pre-zeroed, float32)
+    # Dims
+    total,           # E * C
+    D,               # hidden_dim
+    # Strides
+    stride_src_t, stride_src_d,
+    stride_dst_n, stride_dst_d,
+    # Block
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Scatter-add with Triton atomics.
+    Replaces: output.index_add_(0, flat_tokens, flat_output)
+    Grid: (E*C, ceil(D/BLOCK_D))
+    """
+    pid_t = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    if pid_t >= total:
+        return
+
+    token_idx = tl.load(indices_ptr + pid_t).to(tl.int64)
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    mask_d = offs_d < D
+
+    vals = tl.load(
+        src_ptr + pid_t * stride_src_t + offs_d * stride_src_d,
+        mask=mask_d, other=0.0,
+    ).to(tl.float32)
+
+    tl.atomic_add(
+        dst_ptr + token_idx * stride_dst_n + offs_d * stride_dst_d,
+        vals,
+        mask=mask_d,
+    )
+
+
+def scatter_add_fused(
+    expert_output: torch.Tensor,   # [E, C, D]
+    expert_tokens: torch.Tensor,   # [E, C] int32
+    num_tokens: int,
+    hidden_dim: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Fused scatter-add using Triton atomics."""
+    E, C, D = expert_output.shape
+    total = E * C
+
+    # Accumulate in float32 for precision, then cast
+    output = torch.zeros(num_tokens, hidden_dim, device=device, dtype=torch.float32)
+
+    flat_output = expert_output.reshape(total, D).contiguous()
+    flat_tokens = expert_tokens.reshape(total).contiguous()
+
+    BLOCK_D = 128
+    grid = (total, triton.cdiv(D, BLOCK_D))
+
+    _fused_scatter_add_kernel[grid](
+        flat_output, flat_tokens, output,
+        total, D,
+        flat_output.stride(0), flat_output.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_D=BLOCK_D,
+    )
+
+    return output.to(dtype)
+
+
+# ================================ Triton GEMM Kernels ================================
 
 @triton.jit
 def expert_choice_gather_gemm_kernel(
@@ -409,17 +592,7 @@ def expert_choice_fused_experts(
     )
 
     # ========== Step 4: Scatter-add to output ==========
-    # Use PyTorch for scatter since Triton atomic_add in loops is complex
-    output = torch.zeros(N, hidden_dim, device=device, dtype=dtype)
-
-    # Flatten expert dimension for scatter
-    # expert_tokens: [E, C] -> [E*C]
-    # expert_output: [E, C, hidden_dim] -> [E*C, hidden_dim]
-    flat_tokens = expert_tokens.flatten().long()  # [E*C]
-    flat_output = expert_output.view(E * C, hidden_dim)  # [E*C, hidden_dim]
-
-    # Scatter-add
-    output.index_add_(0, flat_tokens, flat_output)
+    output = scatter_add_fused(expert_output, expert_tokens, N, hidden_dim, dtype, device)
 
     return output
 

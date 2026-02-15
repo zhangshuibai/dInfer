@@ -10,7 +10,7 @@ cd "$SCRIPT_DIR"
 
 parallel_decoding='threshold' # or hierarchy
 length=4096 # generate length
-block_length=4096 # block length
+block_length=1024 # block length
 model_path='/volume/demo/xlzhuang/moeinference/dInfer/models/LLaDA2.0-mini-preview' # your model path
 threshold=0.80 # threshold for parallel decoding
 low_threshold=0.62 # low threshold for parallel decoding when using hierarchy mechanism
@@ -21,8 +21,8 @@ after_look=0
 cont_weight=0 # cont weight
 use_credit=False # enable credit for threshold mechanism
 use_compile=True # use compile
-tp_size=8 # tensor parallel size (using 8 GPUs)
-gpus='0;1;2;3;4;5;6;7' # gpus for tensor parallel inference (using all 8 GPUs)
+tp_size=1 # tensor parallel size (using 8 GPUs)
+gpus='0' # gpus for tensor parallel inference (using all 8 GPUs)
 parallel='tp' # 'tp' for tensor parallel or 'dp' for data parallel
 output_dir='/volume/demo/xlzhuang/moeinference/dInfer/evaluations/outputs' # your customer output path
 model_type='llada2' # llada2 (for llada2-mini) 
@@ -31,7 +31,7 @@ master_port="23456"
 save_samples=False # save samples
 routing_strategy='expert_choice' # 'token_choice' (default) or 'expert_choice' for Expert Choice routing
 expert_capacity='' # capacity per expert for expert_choice (leave empty for auto: n*top_k/num_experts)
-limit=10 # number of samples to run (set to empty '' for full dataset)
+limit=100 # number of samples to run (set to empty '' for full dataset)
 # for llada 1.5 use tasks gsm8k_llada1.5 mbpp_sanitized_llada1.5
 # for llada2_mini use tasks gsm8k_llada_mini mbpp_sanitized_llada_mini
 if [ "${parallel}" = "tp" ]; then

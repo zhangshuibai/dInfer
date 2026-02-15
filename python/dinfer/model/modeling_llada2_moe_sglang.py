@@ -36,6 +36,7 @@ import torch.distributed as dist
 # Expert Choice routing
 from dinfer.model.fused_moe_ec import (
     expert_choice_routing,
+    expert_choice_routing_fused,
     expert_choice_fused_experts,
     ExpertChoiceRoutingOutput,
 )
@@ -640,7 +641,8 @@ class LLaDA2SparseMoeBlock(nn.Module):
                 self._ec_debug_counter += 1
 
             # Get expert choice routing output in native [E, C] format
-            routing_output = expert_choice_routing(
+            # Use fused Triton kernel (softmax + topk in one kernel)
+            routing_output = expert_choice_routing_fused(
                 gating_output=router_logits,
                 capacity=capacity,
                 renormalize=self.norm_topk_prob,
