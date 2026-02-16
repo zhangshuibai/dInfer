@@ -149,9 +149,12 @@ def _fused_softmax_topk_kernel(
     # Iterative top-C: find max, store, mask out
     for _i in range(C):
         cur_max = tl.max(scores, axis=0)
-        is_max = (scores == cur_max) & mask_n
+        # Use >= with small epsilon for robust float comparison across GPU architectures
+        is_max = (scores >= cur_max - 1e-6) & mask_n
         cand = tl.where(is_max, offs_n, N)
         idx = tl.min(cand, axis=0)
+        # Clamp to valid range to prevent out-of-bounds scatter
+        idx = tl.minimum(idx, N - 1)
 
         tl.store(
             expert_tokens_ptr + pid_e * stride_et_e + _i * stride_et_c,
