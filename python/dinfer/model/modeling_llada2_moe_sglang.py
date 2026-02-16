@@ -38,6 +38,7 @@ from dinfer.model.fused_moe_ec import (
     expert_choice_routing,
     expert_choice_routing_fused,
     expert_choice_fused_experts,
+    expert_choice_fused_experts_v2,
     ExpertChoiceRoutingOutput,
 )
 
@@ -714,7 +715,7 @@ class LLaDA2SparseMoeBlock(nn.Module):
             # Check if w1's dim1 == hidden_dim (triton format) or dim2 == hidden_dim (standard)
             use_triton_format = (w1.shape[1] == hidden_dim)
 
-            expert_output = expert_choice_fused_experts(
+            expert_output = expert_choice_fused_experts_v2(
                 hidden_states=hidden_states,
                 w1=w1,
                 w2=w2,

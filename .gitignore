@@ -14,3 +14,5 @@ evaluations/analyze_remask_parallelbench/
 __pycache__/
 *.py[cod]
 *$py.class
+# Model weights
+models/

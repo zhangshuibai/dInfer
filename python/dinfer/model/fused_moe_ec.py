@@ -442,6 +442,183 @@ def expert_choice_gemm_kernel(
     tl.store(out_ptrs, acc.to(output_ptr.dtype.element_ty), mask=mask_c[:, None] & mask_n[None, :])
 
 
+# ================================ Fused V2 Kernels ================================
+# Reduce 4 kernel launches to 2:
+#   Kernel 1: gather + GEMM1 + SiLU+mul  (replaces gather_gemm + silu_and_mul)
+#   Kernel 2: GEMM2 + weighted scatter   (replaces gemm2 + scatter_add)
+
+@triton.jit
+def expert_choice_gather_gemm_silu_kernel(
+    # Inputs
+    hidden_ptr,          # [N, K] input hidden states
+    weight_ptr,          # [E, K, N_gate_up] expert weights w1 (gate_up combined)
+    expert_tokens_ptr,   # [E, C] token indices per expert
+    # Output
+    output_ptr,          # [E, C, HALF_N] intermediate output (after silu+mul)
+    # Dimensions
+    N: tl.constexpr,     # num tokens
+    K: tl.constexpr,     # input hidden dim (e.g. 2048)
+    HALF_N: tl.constexpr,  # intermediate_size (e.g. 512, half of gate_up)
+    E: tl.constexpr,     # num experts
+    C: tl.constexpr,     # capacity
+    # Strides - hidden [N, K]
+    stride_h_n, stride_h_k,
+    # Strides - weight [E, K, gate_up] (SGLang triton format)
+    stride_w_e, stride_w_n, stride_w_k,
+    # Strides - expert_tokens [E, C]
+    stride_et_e, stride_et_c,
+    # Strides - output [E, C, HALF_N]
+    stride_o_e, stride_o_c, stride_o_n,
+    # Block sizes
+    BLOCK_C: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Fused Gather + GEMM1 + SiLU+mul for Expert Choice.
+
+    Each block computes paired column blocks from w1:
+      - gate columns [pid_n*BLOCK_N, pid_n*BLOCK_N + BLOCK_N)
+      - up columns   [pid_n*BLOCK_N + HALF_N, pid_n*BLOCK_N + HALF_N + BLOCK_N)
+    Then applies: output = silu(gate) * up
+
+    Output shape: [E, C, HALF_N] (half of gate_up)
+    """
+    pid_e = tl.program_id(0)  # expert index
+    pid_c = tl.program_id(1)  # token block within expert
+    pid_n = tl.program_id(2)  # output dim block (over HALF_N, not full gate_up)
+
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_c = offs_c < C
+    mask_n = offs_n < HALF_N
+
+    # Load token indices for this expert
+    token_idx_ptr = expert_tokens_ptr + pid_e * stride_et_e + offs_c * stride_et_c
+    token_indices = tl.load(token_idx_ptr, mask=mask_c, other=0)
+
+    # Two accumulators: gate and up halves
+    acc_gate = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
+    acc_up = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
+
+    # Column offsets in w1 for gate and up halves
+    offs_n_gate = offs_n         # columns [0, HALF_N)
+    offs_n_up = offs_n + HALF_N  # columns [HALF_N, 2*HALF_N)
+
+    # Loop over K dimension
+    for k_start in range(0, K, BLOCK_K):
+        k_offs = k_start + offs_k
+        mask_k = k_offs < K
+
+        # Load hidden states: gather from token_indices (shared for both halves)
+        h_ptrs = hidden_ptr + token_indices[:, None] * stride_h_n + k_offs[None, :] * stride_h_k
+        h = tl.load(h_ptrs, mask=mask_c[:, None] & mask_k[None, :], other=0.0)
+
+        # Load gate weights: w1[e, k, n_gate]
+        w_gate_ptrs = weight_ptr + pid_e * stride_w_e + k_offs[:, None] * stride_w_k + offs_n_gate[None, :] * stride_w_n
+        w_gate = tl.load(w_gate_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        # Load up weights: w1[e, k, n_up]
+        w_up_ptrs = weight_ptr + pid_e * stride_w_e + k_offs[:, None] * stride_w_k + offs_n_up[None, :] * stride_w_n
+        w_up = tl.load(w_up_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        # GEMM for both halves
+        acc_gate += tl.dot(h, w_gate)
+        acc_up += tl.dot(h, w_up)
+
+    # Apply SiLU(gate) * up in fp32 registers
+    # SiLU(x) = x * sigmoid(x)
+    result = (acc_gate * tl.sigmoid(acc_gate)) * acc_up
+
+    # Store output [E, C, HALF_N]
+    out_ptrs = output_ptr + pid_e * stride_o_e + offs_c[:, None] * stride_o_c + offs_n[None, :] * stride_o_n
+    tl.store(out_ptrs, result.to(output_ptr.dtype.element_ty), mask=mask_c[:, None] & mask_n[None, :])
+
+
+@triton.jit
+def expert_choice_gemm_scatter_kernel(
+    # Inputs
+    intermediate_ptr,    # [E, C, K] intermediate activations
+    weight_ptr,          # [E, N_out, K] expert weights (w2)
+    expert_weights_ptr,  # [E, C] routing weights
+    expert_tokens_ptr,   # [E, C] token indices for scatter
+    # Output
+    output_ptr,          # [N, N_out] output (fp32, pre-zeroed)
+    # Dimensions
+    K: tl.constexpr,     # intermediate dim
+    N_out: tl.constexpr, # output hidden dim
+    C: tl.constexpr,     # capacity
+    N_tokens: tl.constexpr,  # total number of tokens
+    # Strides - intermediate [E, C, K]
+    stride_i_e, stride_i_c, stride_i_k,
+    # Strides - weight [E, N_out, K] (logical)
+    stride_w_e, stride_w_n, stride_w_k,
+    # Strides - expert_weights [E, C]
+    stride_ew_e, stride_ew_c,
+    # Strides - expert_tokens [E, C]
+    stride_et_e, stride_et_c,
+    # Strides - output [N, N_out]
+    stride_o_n, stride_o_d,
+    # Block sizes
+    BLOCK_C: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Fused GEMM2 + weighted scatter for Expert Choice.
+
+    Computes: output[token_idx] += (intermediate[e] @ w2[e].T) * routing_weight
+    Uses tl.atomic_add to scatter directly to the output tensor.
+    """
+    pid_e = tl.program_id(0)  # expert index
+    pid_c = tl.program_id(1)  # token block within expert
+    pid_n = tl.program_id(2)  # output dim block
+
+    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    mask_c = offs_c < C
+    mask_n = offs_n < N_out
+
+    # Load routing weights [BLOCK_C]
+    ew_ptrs = expert_weights_ptr + pid_e * stride_ew_e + offs_c * stride_ew_c
+    routing_weights = tl.load(ew_ptrs, mask=mask_c, other=0.0)
+
+    # Load token indices for scatter [BLOCK_C]
+    et_ptrs = expert_tokens_ptr + pid_e * stride_et_e + offs_c * stride_et_c
+    token_indices = tl.load(et_ptrs, mask=mask_c, other=0).to(tl.int64)
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_C, BLOCK_N), dtype=tl.float32)
+
+    # Loop over K dimension (intermediate_size)
+    for k_start in range(0, K, BLOCK_K):
+        k_offs = k_start + offs_k
+        mask_k = k_offs < K
+
+        # Load intermediate activations [BLOCK_C, BLOCK_K]
+        i_ptrs = intermediate_ptr + pid_e * stride_i_e + offs_c[:, None] * stride_i_c + k_offs[None, :] * stride_i_k
+        i_val = tl.load(i_ptrs, mask=mask_c[:, None] & mask_k[None, :], other=0.0)
+
+        # Load weights [BLOCK_K, BLOCK_N]
+        w_ptrs = weight_ptr + pid_e * stride_w_e + k_offs[:, None] * stride_w_k + offs_n[None, :] * stride_w_n
+        w = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        acc += tl.dot(i_val, w)
+
+    # Apply routing weights: acc[c, n] *= routing_weights[c]
+    acc = acc * routing_weights[:, None]
+
+    # Scatter-add to output[token_indices[c], offs_n] using vectorized atomic_add
+    # token_indices: [BLOCK_C], offs_n: [BLOCK_N]
+    # Compute 2D output pointer grid: [BLOCK_C, BLOCK_N]
+    out_ptrs = output_ptr + token_indices[:, None] * stride_o_n + offs_n[None, :] * stride_o_d
+    tl.atomic_add(out_ptrs, acc, mask=mask_c[:, None] & mask_n[None, :])
+
+
 # ================================ Main Functions ================================
 def expert_choice_fused_experts(
     hidden_states: torch.Tensor,
@@ -595,6 +772,99 @@ def expert_choice_fused_experts(
     output = scatter_add_fused(expert_output, expert_tokens, N, hidden_dim, dtype, device)
 
     return output
+
+
+def expert_choice_fused_experts_v2(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    routing_output: ExpertChoiceRoutingOutput,
+    activation: str = "silu",
+    use_triton_weight_format: bool = True,
+) -> torch.Tensor:
+    """
+    Expert Choice MoE forward pass - V2 with 2 fused kernels.
+
+    Kernel 1: gather + GEMM1 + SiLU+mul → [E, C, intermediate_size]
+    Kernel 2: GEMM2 + weighted atomic scatter → [N, hidden_dim]
+
+    Only 2 kernel launches instead of 4 in v1.
+    """
+    N, hidden_dim = hidden_states.shape
+    E = routing_output.num_experts
+    C = routing_output.capacity
+
+    if use_triton_weight_format:
+        intermediate_size = w1.shape[2] // 2
+    else:
+        intermediate_size = w1.shape[1] // 2
+
+    expert_tokens = routing_output.expert_tokens
+    expert_weights = routing_output.expert_weights
+
+    device = hidden_states.device
+    dtype = hidden_states.dtype
+
+    # ========== Step 1: Gather + GEMM1 + SiLU+mul (fused) ==========
+    intermediate = torch.empty(
+        (E, C, intermediate_size),
+        device=device,
+        dtype=dtype,
+    )
+
+    BLOCK_C = 16 if C < 32 else 32
+    BLOCK_K = 64
+    BLOCK_N = 64
+
+    grid_gemm1 = (
+        E,
+        triton.cdiv(C, BLOCK_C),
+        triton.cdiv(intermediate_size, BLOCK_N),  # over HALF_N, not full gate_up
+    )
+
+    if use_triton_weight_format:
+        w1_strides = (w1.stride(0), w1.stride(2), w1.stride(1))
+    else:
+        w1_strides = (w1.stride(0), w1.stride(1), w1.stride(2))
+
+    expert_choice_gather_gemm_silu_kernel[grid_gemm1](
+        hidden_states, w1, expert_tokens,
+        intermediate,
+        N, hidden_dim, intermediate_size, E, C,
+        hidden_states.stride(0), hidden_states.stride(1),
+        w1_strides[0], w1_strides[1], w1_strides[2],
+        expert_tokens.stride(0), expert_tokens.stride(1),
+        intermediate.stride(0), intermediate.stride(1), intermediate.stride(2),
+        BLOCK_C=BLOCK_C, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+    )
+
+    # ========== Step 2: GEMM2 + weighted scatter (fused) ==========
+    output = torch.zeros(N, hidden_dim, device=device, dtype=torch.float32)
+
+    grid_gemm2 = (
+        E,
+        triton.cdiv(C, BLOCK_C),
+        triton.cdiv(hidden_dim, BLOCK_N),
+    )
+
+    if use_triton_weight_format:
+        w2_strides = (w2.stride(0), w2.stride(2), w2.stride(1))
+    else:
+        w2_strides = (w2.stride(0), w2.stride(1), w2.stride(2))
+
+    expert_choice_gemm_scatter_kernel[grid_gemm2](
+        intermediate, w2, expert_weights, expert_tokens,
+        output,
+        intermediate_size, hidden_dim, C, N,
+        intermediate.stride(0), intermediate.stride(1), intermediate.stride(2),
+        w2_strides[0], w2_strides[1], w2_strides[2],
+        expert_weights.stride(0), expert_weights.stride(1),
+        expert_tokens.stride(0), expert_tokens.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_C=BLOCK_C, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+    )
+
+    return output.to(dtype)
 
 
 # ================================ PyTorch Reference Implementation ================================

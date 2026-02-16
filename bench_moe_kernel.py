@@ -233,6 +233,60 @@ def bench_expert_choice_fused(moe_layer, hidden_states, warmup=10, repeat=100):
 
 
 @torch.no_grad()
+def bench_expert_choice_fused_v2(moe_layer, hidden_states, warmup=10, repeat=100):
+    """Benchmark: gate → fused_routing → fused_experts_v2 (2 kernels: GEMM1+SiLU, GEMM2+Scatter)."""
+    from dinfer.model.fused_moe_ec import expert_choice_routing_fused, expert_choice_fused_experts_v2
+
+    hs = hidden_states.view(-1, hidden_states.shape[-1])
+    top_k = moe_layer.top_k
+    num_experts = moe_layer.num_experts
+    w1 = moe_layer.experts.w13_weight
+    w2 = moe_layer.experts.w2_weight
+    hidden_dim = hs.shape[-1]
+    use_triton_format = (w1.shape[1] == hidden_dim)
+
+    # warmup
+    for _ in range(warmup):
+        router_logits = moe_layer.gate(hs)
+        num_tokens = hs.shape[0]
+        capacity = max(1, (num_tokens * top_k) // num_experts)
+        routing_output = expert_choice_routing_fused(
+            gating_output=router_logits, capacity=capacity,
+            renormalize=moe_layer.norm_topk_prob,
+        )
+        _ = expert_choice_fused_experts_v2(
+            hidden_states=hs, w1=w1, w2=w2,
+            routing_output=routing_output, activation="silu",
+            use_triton_weight_format=use_triton_format,
+        )
+    torch.cuda.synchronize()
+
+    # timed runs
+    start_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+    end_events = [torch.cuda.Event(enable_timing=True) for _ in range(repeat)]
+
+    for i in range(repeat):
+        start_events[i].record()
+        router_logits = moe_layer.gate(hs)
+        num_tokens = hs.shape[0]
+        capacity = max(1, (num_tokens * top_k) // num_experts)
+        routing_output = expert_choice_routing_fused(
+            gating_output=router_logits, capacity=capacity,
+            renormalize=moe_layer.norm_topk_prob,
+        )
+        _ = expert_choice_fused_experts_v2(
+            hidden_states=hs, w1=w1, w2=w2,
+            routing_output=routing_output, activation="silu",
+            use_triton_weight_format=use_triton_format,
+        )
+        end_events[i].record()
+
+    torch.cuda.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+    return times
+
+
+@torch.no_grad()
 def bench_token_choice_breakdown(moe_layer, hidden_states, warmup=10, repeat=100):
     """Breakdown for Token Choice: gate / topk / experts (FusedMoE)."""
     hs = hidden_states.view(-1, hidden_states.shape[-1])
@@ -526,6 +580,119 @@ def bench_expert_choice_fused_breakdown(moe_layer, hidden_states, warmup=10, rep
     return results
 
 
+@torch.no_grad()
+def bench_expert_choice_fused_v2_breakdown(moe_layer, hidden_states, warmup=10, repeat=100):
+    """Breakdown: gate / routing_fused / gemm1_silu(fused) / gemm2_scatter(fused) — only 2 compute kernels."""
+    from dinfer.model.fused_moe_ec import (
+        expert_choice_routing_fused,
+        expert_choice_gather_gemm_silu_kernel,
+        expert_choice_gemm_scatter_kernel,
+    )
+
+    import triton
+    hs = hidden_states.view(-1, hidden_states.shape[-1])
+    top_k = moe_layer.top_k
+    num_experts = moe_layer.num_experts
+    w1 = moe_layer.experts.w13_weight
+    w2 = moe_layer.experts.w2_weight
+    hidden_dim = hs.shape[-1]
+    use_triton_format = (w1.shape[1] == hidden_dim)
+    if use_triton_format:
+        intermediate_size = w1.shape[2] // 2
+    else:
+        intermediate_size = w1.shape[1] // 2
+    num_tokens = hs.shape[0]
+    capacity = max(1, (num_tokens * top_k) // num_experts)
+    E = num_experts
+    C = capacity
+    device = hs.device
+    dtype = hs.dtype
+
+    BLOCK_C = 16 if C < 32 else 32
+    grid1 = (E, triton.cdiv(C, BLOCK_C), triton.cdiv(intermediate_size, 64))
+    grid2 = (E, triton.cdiv(C, BLOCK_C), triton.cdiv(hidden_dim, 64))
+    if use_triton_format:
+        w1_strides = (w1.stride(0), w1.stride(2), w1.stride(1))
+        w2_strides = (w2.stride(0), w2.stride(2), w2.stride(1))
+    else:
+        w1_strides = (w1.stride(0), w1.stride(1), w1.stride(2))
+        w2_strides = (w2.stride(0), w2.stride(1), w2.stride(2))
+
+    # warmup
+    for _ in range(warmup):
+        rl = moe_layer.gate(hs)
+        ro = expert_choice_routing_fused(rl, capacity, moe_layer.norm_topk_prob)
+        intermediate = torch.empty((E, C, intermediate_size), device=device, dtype=dtype)
+        expert_choice_gather_gemm_silu_kernel[grid1](
+            hs, w1, ro.expert_tokens, intermediate,
+            num_tokens, hidden_dim, intermediate_size, E, C,
+            hs.stride(0), hs.stride(1),
+            w1_strides[0], w1_strides[1], w1_strides[2],
+            ro.expert_tokens.stride(0), ro.expert_tokens.stride(1),
+            intermediate.stride(0), intermediate.stride(1), intermediate.stride(2),
+            BLOCK_C=BLOCK_C, BLOCK_K=64, BLOCK_N=64,
+        )
+        output = torch.zeros(num_tokens, hidden_dim, device=device, dtype=torch.float32)
+        expert_choice_gemm_scatter_kernel[grid2](
+            intermediate, w2, ro.expert_weights, ro.expert_tokens, output,
+            intermediate_size, hidden_dim, C, num_tokens,
+            intermediate.stride(0), intermediate.stride(1), intermediate.stride(2),
+            w2_strides[0], w2_strides[1], w2_strides[2],
+            ro.expert_weights.stride(0), ro.expert_weights.stride(1),
+            ro.expert_tokens.stride(0), ro.expert_tokens.stride(1),
+            output.stride(0), output.stride(1),
+            BLOCK_C=BLOCK_C, BLOCK_K=64, BLOCK_N=64,
+        )
+    torch.cuda.synchronize()
+
+    stages = ["gate", "routing", "gemm1_silu", "gemm2_scatter"]
+    results = {s: [] for s in stages}
+
+    for _ in range(repeat):
+        events = {s: (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) for s in stages}
+
+        events["gate"][0].record()
+        rl = moe_layer.gate(hs)
+        events["gate"][1].record()
+
+        events["routing"][0].record()
+        ro = expert_choice_routing_fused(rl, capacity, moe_layer.norm_topk_prob)
+        events["routing"][1].record()
+
+        intermediate = torch.empty((E, C, intermediate_size), device=device, dtype=dtype)
+        events["gemm1_silu"][0].record()
+        expert_choice_gather_gemm_silu_kernel[grid1](
+            hs, w1, ro.expert_tokens, intermediate,
+            num_tokens, hidden_dim, intermediate_size, E, C,
+            hs.stride(0), hs.stride(1),
+            w1_strides[0], w1_strides[1], w1_strides[2],
+            ro.expert_tokens.stride(0), ro.expert_tokens.stride(1),
+            intermediate.stride(0), intermediate.stride(1), intermediate.stride(2),
+            BLOCK_C=BLOCK_C, BLOCK_K=64, BLOCK_N=64,
+        )
+        events["gemm1_silu"][1].record()
+
+        output = torch.zeros(num_tokens, hidden_dim, device=device, dtype=torch.float32)
+        events["gemm2_scatter"][0].record()
+        expert_choice_gemm_scatter_kernel[grid2](
+            intermediate, w2, ro.expert_weights, ro.expert_tokens, output,
+            intermediate_size, hidden_dim, C, num_tokens,
+            intermediate.stride(0), intermediate.stride(1), intermediate.stride(2),
+            w2_strides[0], w2_strides[1], w2_strides[2],
+            ro.expert_weights.stride(0), ro.expert_weights.stride(1),
+            ro.expert_tokens.stride(0), ro.expert_tokens.stride(1),
+            output.stride(0), output.stride(1),
+            BLOCK_C=BLOCK_C, BLOCK_K=64, BLOCK_N=64,
+        )
+        events["gemm2_scatter"][1].record()
+
+        torch.cuda.synchronize()
+        for s in stages:
+            results[s].append(events[s][0].elapsed_time(events[s][1]))
+
+    return results
+
+
 # ─────────────────────── main ───────────────────────
 
 def main():
@@ -636,97 +803,97 @@ def main():
         ec_p10 = sorted(ec_times)[len(ec_times) // 10]
         ec_p90 = sorted(ec_times)[len(ec_times) * 9 // 10]
 
-        # Expert Choice Fused (Triton routing + Triton scatter)
+        # Expert Choice Fused v1 (Triton routing + Triton scatter, 4 compute kernels)
         ecf_times = bench_expert_choice_fused(moe_layer, hidden_states, warmup=args.warmup, repeat=args.repeat)
         ecf_median = sorted(ecf_times)[len(ecf_times) // 2]
         ecf_mean = sum(ecf_times) / len(ecf_times)
-        ecf_p10 = sorted(ecf_times)[len(ecf_times) // 10]
-        ecf_p90 = sorted(ecf_times)[len(ecf_times) * 9 // 10]
 
-        ec_tc_ratio = ec_median / tc_median if tc_median > 0 else float("inf")
-        ecf_tc_ratio = ecf_median / tc_median if tc_median > 0 else float("inf")
-        speedup = ec_median / ecf_median if ecf_median > 0 else float("inf")
+        # Expert Choice Fused v2 (2 compute kernels: GEMM1+SiLU, GEMM2+Scatter)
+        ecf2_times = bench_expert_choice_fused_v2(moe_layer, hidden_states, warmup=args.warmup, repeat=args.repeat)
+        ecf2_median = sorted(ecf2_times)[len(ecf2_times) // 2]
+        ecf2_mean = sum(ecf2_times) / len(ecf2_times)
 
-        print(f"  Token  Choice:       median={tc_median:.3f}ms  mean={tc_mean:.3f}ms  p10={tc_p10:.3f}ms  p90={tc_p90:.3f}ms")
-        print(f"  Expert Choice:       median={ec_median:.3f}ms  mean={ec_mean:.3f}ms  p10={ec_p10:.3f}ms  p90={ec_p90:.3f}ms")
-        print(f"  Expert Choice Fused: median={ecf_median:.3f}ms  mean={ecf_mean:.3f}ms  p10={ecf_p10:.3f}ms  p90={ecf_p90:.3f}ms")
-        print(f"  EC / TC ratio:       {ec_tc_ratio:.2f}x")
-        print(f"  EC-Fused / TC ratio: {ecf_tc_ratio:.2f}x")
-        print(f"  Fused speedup:       {speedup:.2f}x over original EC")
+        ec_tc = ec_median / tc_median if tc_median > 0 else float("inf")
+        ecf_tc = ecf_median / tc_median if tc_median > 0 else float("inf")
+        ecf2_tc = ecf2_median / tc_median if tc_median > 0 else float("inf")
+        v2_vs_v1 = ecf_median / ecf2_median if ecf2_median > 0 else float("inf")
+        v2_vs_ec = ec_median / ecf2_median if ecf2_median > 0 else float("inf")
+
+        print(f"  Token  Choice:    median={tc_median:.3f}ms   mean={tc_mean:.3f}ms")
+        print(f"  EC (original):    median={ec_median:.3f}ms   mean={ec_mean:.3f}ms   EC/TC={ec_tc:.2f}x")
+        print(f"  EC-Fused v1:      median={ecf_median:.3f}ms   mean={ecf_mean:.3f}ms   v1/TC={ecf_tc:.2f}x")
+        print(f"  EC-Fused v2:      median={ecf2_median:.3f}ms   mean={ecf2_mean:.3f}ms   v2/TC={ecf2_tc:.2f}x")
+        print(f"  v2 speedup:       {v2_vs_v1:.2f}x over v1,  {v2_vs_ec:.2f}x over original EC")
 
         all_results.append({
             "N": N, "C": capacity,
-            "tc_median": tc_median, "tc_mean": tc_mean,
-            "ec_median": ec_median, "ec_mean": ec_mean,
-            "ecf_median": ecf_median, "ecf_mean": ecf_mean,
-            "ec_tc_ratio": ec_tc_ratio,
-            "ecf_tc_ratio": ecf_tc_ratio,
-            "speedup": speedup,
+            "tc_median": tc_median,
+            "ec_median": ec_median,
+            "ecf_median": ecf_median,
+            "ecf2_median": ecf2_median,
+            "ec_tc": ec_tc, "ecf_tc": ecf_tc, "ecf2_tc": ecf2_tc,
+            "v2_vs_v1": v2_vs_v1,
         })
 
-        # Breakdown: side-by-side comparison of all three paths
+        # Breakdown: side-by-side comparison
         if args.breakdown:
             print(f"\n  [Per-Stage Breakdown] (N={N}, E={moe_layer.num_experts}, C={capacity})")
 
             tc_bd = bench_token_choice_breakdown(moe_layer, hidden_states, warmup=args.warmup, repeat=args.repeat)
             ec_bd = bench_expert_choice_breakdown(moe_layer, hidden_states, warmup=args.warmup, repeat=args.repeat)
-            ecf_bd = bench_expert_choice_fused_breakdown(moe_layer, hidden_states, warmup=args.warmup, repeat=args.repeat)
+            ecf2_bd = bench_expert_choice_fused_v2_breakdown(moe_layer, hidden_states, warmup=args.warmup, repeat=args.repeat)
 
-            # Compute medians
             def get_median(times_list):
                 s = sorted(times_list)
                 return s[len(s) // 2]
 
-            # All stages across all methods (TC has fewer stages)
-            all_stages = ["gate", "routing", "gemm1", "activation", "gemm2", "scatter", "experts"]
+            # Stages: TC has (gate, routing, experts); EC has (gate, routing, gemm1, activation, gemm2, scatter);
+            # v2 has (gate, routing, gemm1_silu, gemm2_scatter)
+            all_stages = ["gate", "routing", "gemm1", "activation", "gemm2", "scatter",
+                          "gemm1_silu", "gemm2_scatter", "experts"]
 
             tc_medians = {s: get_median(tc_bd[s]) for s in tc_bd}
             ec_medians = {s: get_median(ec_bd[s]) for s in ec_bd}
-            ecf_medians = {s: get_median(ecf_bd[s]) for s in ecf_bd}
+            ecf2_medians = {s: get_median(ecf2_bd[s]) for s in ecf2_bd}
 
             tc_total = sum(tc_medians.values())
             ec_total = sum(ec_medians.values())
-            ecf_total = sum(ecf_medians.values())
+            ecf2_total = sum(ecf2_medians.values())
 
-            # Print header
-            print(f"    {'stage':>12s}  |  {'TC (SGLang)':>14s}  {'%':>5s}  |  {'EC (PyTorch)':>14s}  {'%':>5s}  |  {'EC-Fused':>14s}  {'%':>5s}  |  {'Fused Speedup':>14s}")
-            print(f"    {'-'*12}  +  {'-'*14}  {'-'*5}  +  {'-'*14}  {'-'*5}  +  {'-'*14}  {'-'*5}  +  {'-'*14}")
+            print(f"    {'stage':>14s}  |  {'TC (SGLang)':>14s}  {'%':>5s}  |  {'EC (4 kern)':>14s}  {'%':>5s}  |  {'EC-v2 (2 kern)':>14s}  {'%':>5s}")
+            print(f"    {'-'*14}  +  {'-'*14}  {'-'*5}  +  {'-'*14}  {'-'*5}  +  {'-'*14}  {'-'*5}")
 
             for stage in all_stages:
                 tc_val = tc_medians.get(stage, None)
                 ec_val = ec_medians.get(stage, None)
-                ecf_val = ecf_medians.get(stage, None)
+                ecf2_val = ecf2_medians.get(stage, None)
+
+                # Skip stages that don't exist in any method
+                if tc_val is None and ec_val is None and ecf2_val is None:
+                    continue
 
                 tc_str = f"{tc_val:.3f}ms" if tc_val is not None else "---"
                 tc_pct = f"{tc_val/tc_total*100:.1f}%" if tc_val is not None else "---"
                 ec_str = f"{ec_val:.3f}ms" if ec_val is not None else "---"
                 ec_pct = f"{ec_val/ec_total*100:.1f}%" if ec_val is not None else "---"
-                ecf_str = f"{ecf_val:.3f}ms" if ecf_val is not None else "---"
-                ecf_pct = f"{ecf_val/ecf_total*100:.1f}%" if ecf_val is not None else "---"
+                ecf2_str = f"{ecf2_val:.3f}ms" if ecf2_val is not None else "---"
+                ecf2_pct = f"{ecf2_val/ecf2_total*100:.1f}%" if ecf2_val is not None else "---"
 
-                # Speedup of fused vs original EC for this stage
-                if ec_val is not None and ecf_val is not None and ecf_val > 0:
-                    spd = f"{ec_val/ecf_val:.2f}x"
-                else:
-                    spd = "---"
+                print(f"    {stage:>14s}  |  {tc_str:>14s}  {tc_pct:>5s}  |  {ec_str:>14s}  {ec_pct:>5s}  |  {ecf2_str:>14s}  {ecf2_pct:>5s}")
 
-                print(f"    {stage:>12s}  |  {tc_str:>14s}  {tc_pct:>5s}  |  {ec_str:>14s}  {ec_pct:>5s}  |  {ecf_str:>14s}  {ecf_pct:>5s}  |  {spd:>14s}")
-
-            # Total row
-            print(f"    {'-'*12}  +  {'-'*14}  {'-'*5}  +  {'-'*14}  {'-'*5}  +  {'-'*14}  {'-'*5}  +  {'-'*14}")
-            spd_total = f"{ec_total/ecf_total:.2f}x" if ecf_total > 0 else "---"
-            print(f"    {'TOTAL':>12s}  |  {tc_total:>13.3f}ms  {'100%':>5s}  |  {ec_total:>13.3f}ms  {'100%':>5s}  |  {ecf_total:>13.3f}ms  {'100%':>5s}  |  {spd_total:>14s}")
-            print(f"    {'EC/TC':>12s}  |  {'':>14s}  {'':>5s}  |  {ec_total/tc_total:>13.2f}x  {'':>5s}  |  {ecf_total/tc_total:>13.2f}x  {'':>5s}  |")
+            print(f"    {'-'*14}  +  {'-'*14}  {'-'*5}  +  {'-'*14}  {'-'*5}  +  {'-'*14}  {'-'*5}")
+            print(f"    {'TOTAL':>14s}  |  {tc_total:>13.3f}ms  {'100%':>5s}  |  {ec_total:>13.3f}ms  {'100%':>5s}  |  {ecf2_total:>13.3f}ms  {'100%':>5s}")
+            print(f"    {'vs TC':>14s}  |  {'1.00x':>14s}  {'':>5s}  |  {ec_total/tc_total:>13.2f}x  {'':>5s}  |  {ecf2_total/tc_total:>13.2f}x  {'':>5s}")
 
     # ---- summary ----
-    print(f"\n{'='*100}")
+    print(f"\n{'='*110}")
     print(f"  SUMMARY")
-    print(f"{'='*100}")
-    print(f"  {'N':>6s}  {'C':>4s}  {'TC median':>10s}  {'EC median':>10s}  {'ECF median':>11s}  {'EC/TC':>7s}  {'ECF/TC':>7s}  {'Speedup':>8s}")
-    print(f"  {'-'*6}  {'-'*4}  {'-'*10}  {'-'*10}  {'-'*11}  {'-'*7}  {'-'*7}  {'-'*8}")
+    print(f"{'='*110}")
+    print(f"  {'N':>6s}  {'C':>4s}  {'TC':>9s}  {'EC':>9s}  {'EC-v1':>9s}  {'EC-v2':>9s}  {'EC/TC':>7s}  {'v1/TC':>7s}  {'v2/TC':>7s}  {'v2/v1':>7s}")
+    print(f"  {'-'*6}  {'-'*4}  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*9}  {'-'*7}  {'-'*7}  {'-'*7}  {'-'*7}")
     for r in all_results:
-        print(f"  {r['N']:>6d}  {r['C']:>4d}  {r['tc_median']:>9.3f}ms  {r['ec_median']:>9.3f}ms  {r['ecf_median']:>10.3f}ms  {r['ec_tc_ratio']:>6.2f}x  {r['ecf_tc_ratio']:>6.2f}x  {r['speedup']:>7.2f}x")
-    print(f"{'='*100}")
+        print(f"  {r['N']:>6d}  {r['C']:>4d}  {r['tc_median']:>8.3f}ms {r['ec_median']:>8.3f}ms {r['ecf_median']:>8.3f}ms {r['ecf2_median']:>8.3f}ms {r['ec_tc']:>6.2f}x {r['ecf_tc']:>6.2f}x {r['ecf2_tc']:>6.2f}x {r['v2_vs_v1']:>6.2f}x")
+    print(f"{'='*110}")
 
 
 if __name__ == "__main__":
