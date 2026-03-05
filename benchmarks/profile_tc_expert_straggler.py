@@ -295,6 +295,7 @@ class TCExpertProfiler:
         layer_csv = os.path.join(out_dir, "layer_summary.csv")
         expert_csv = os.path.join(out_dir, "expert_summary.csv")
         detailed_csv = os.path.join(out_dir, "expert_detailed_timing.csv")
+        layer_internal_csv = os.path.join(out_dir, "layer_internal_straggler.csv")
 
         with open(layer_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -360,6 +361,62 @@ class TCExpertProfiler:
                         ]
                     )
 
+        # Per-layer internal comparison (within same layer only).
+        # This is the key table to detect if one expert drags a layer.
+        with open(layer_internal_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "layer_id",
+                    "active_experts",
+                    "slowest_expert_id",
+                    "slowest_est_ms",
+                    "fastest_expert_id",
+                    "fastest_est_ms",
+                    "mean_est_ms",
+                    "p50_est_ms",
+                    "p95_est_ms",
+                    "slow_over_mean",
+                    "slow_over_p50",
+                    "slow_over_fast",
+                ]
+            )
+            for layer_id in sorted(self.layer_stats):
+                s = self.layer_stats[layer_id]
+                calls = max(s.calls, 1)
+                avg_counts = s.expert_count_sum / calls
+                ests = []
+                for e in range(s.num_experts):
+                    if avg_counts[e].item() <= 0:
+                        continue
+                    est_ms = float((s.expert_est_ms_sum[e] / calls).item())
+                    ests.append((e, est_ms))
+                if not ests:
+                    continue
+                ests_sorted = sorted(ests, key=lambda x: x[1])
+                vals = [x[1] for x in ests_sorted]
+                mean_v = sum(vals) / len(vals)
+                p50 = vals[len(vals) // 2]
+                p95 = vals[min(len(vals) - 1, int(0.95 * len(vals)))]
+                fast_e, fast_v = ests_sorted[0]
+                slow_e, slow_v = ests_sorted[-1]
+                writer.writerow(
+                    [
+                        layer_id,
+                        len(vals),
+                        slow_e,
+                        slow_v,
+                        fast_e,
+                        fast_v,
+                        mean_v,
+                        p50,
+                        p95,
+                        slow_v / max(mean_v, 1e-12),
+                        slow_v / max(p50, 1e-12),
+                        slow_v / max(fast_v, 1e-12),
+                    ]
+                )
+
         if self.detailed_expert_timing and self.detailed_ms:
             with open(detailed_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
@@ -392,6 +449,7 @@ class TCExpertProfiler:
 
         print(f"[Profile] Wrote: {layer_csv}")
         print(f"[Profile] Wrote: {expert_csv}")
+        print(f"[Profile] Wrote: {layer_internal_csv}")
         if self.detailed_expert_timing:
             print(f"[Profile] Wrote: {detailed_csv}")
 
@@ -409,6 +467,50 @@ class TCExpertProfiler:
         print("rank  layer  expert  est_ms  avg_assignments")
         for i, (est_ms, avg_assign, layer_id, expert_id) in enumerate(candidates[:topn], start=1):
             print(f"{i:>4}  {layer_id:>5}  {expert_id:>6}  {est_ms:>6.3f}  {avg_assign:>15.3f}")
+
+    def print_layer_internal_stragglers(self, topn_layers: int = 10, min_avg_assignments: float = 1.0):
+        rows = []
+        for layer_id, s in self.layer_stats.items():
+            calls = max(s.calls, 1)
+            avg_counts = s.expert_count_sum / calls
+            ests = []
+            for e in range(s.num_experts):
+                avg_assign = float(avg_counts[e].item())
+                if avg_assign < min_avg_assignments:
+                    continue
+                est_ms = float((s.expert_est_ms_sum[e] / calls).item())
+                ests.append((e, est_ms, avg_assign))
+            if len(ests) < 2:
+                continue
+            vals = sorted(x[1] for x in ests)
+            mean_v = sum(vals) / len(vals)
+            p50 = vals[len(vals) // 2]
+            slow_e, slow_v, slow_assign = max(ests, key=lambda x: x[1])
+            fast_e, fast_v, fast_assign = min(ests, key=lambda x: x[1])
+            rows.append(
+                (
+                    slow_v / max(mean_v, 1e-12),
+                    layer_id,
+                    slow_e,
+                    slow_v,
+                    slow_assign,
+                    fast_e,
+                    fast_v,
+                    fast_assign,
+                    mean_v,
+                    p50,
+                )
+            )
+
+        rows.sort(reverse=True, key=lambda x: x[0])
+        print("\n[Layer-Internal Stragglers]")
+        print("rank  layer  slow_e  slow_ms  slow_avg_assign  fast_e  fast_ms  mean_ms  p50_ms  slow/mean")
+        for i, r in enumerate(rows[:topn_layers], start=1):
+            _, layer_id, slow_e, slow_v, slow_assign, fast_e, fast_v, _, mean_v, p50 = r
+            print(
+                f"{i:>4}  {layer_id:>5}  {slow_e:>6}  {slow_v:>7.4f}  {slow_assign:>15.2f}  "
+                f"{fast_e:>6}  {fast_v:>7.4f}  {mean_v:>7.4f}  {p50:>7.4f}  {slow_v/max(mean_v,1e-12):>9.2f}"
+            )
 
 
 def parse_args():
@@ -734,6 +836,7 @@ def main():
         profiler.uninstall_hooks()
         profiler.dump(args.out_dir)
         profiler.print_top_stragglers(topn=10)
+        profiler.print_layer_internal_stragglers(topn_layers=10, min_avg_assignments=5.0)
 
         avg_step_ms = sum(step_times) / max(len(step_times), 1)
         print(f"\n[Profile] Average end-to-end forward time: {avg_step_ms:.3f} ms")
