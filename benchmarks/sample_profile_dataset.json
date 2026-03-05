@@ -1,0 +1,12 @@
+{
+  "judge_details": [
+    {"prompt": "Lily can run 12 kilometers per hour for 4 hours. After that, she can run 6 kilometers per hour. How many kilometers can she run in 8 hours?"},
+    {"prompt": "If a train travels 90 km/h for 2.5 hours, what distance does it cover?"},
+    {"prompt": "A shop offers 20% off on a $75 item. What is the final price?"},
+    {"prompt": "Write a short Python function to check whether a string is a palindrome."},
+    {"prompt": "Summarize the benefits and risks of using caching in large-scale inference systems."},
+    {"prompt": "Solve: 3x + 7 = 28. Show the steps briefly."},
+    {"prompt": "Explain the difference between process-level parallelism and thread-level parallelism."},
+    {"prompt": "Given the list [5, 1, 4, 2, 3], describe one pass of bubble sort."}
+  ]
+}

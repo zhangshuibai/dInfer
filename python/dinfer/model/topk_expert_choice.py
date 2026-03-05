@@ -31,17 +31,23 @@ from typing import (
 import torch
 import torch.nn.functional as F
 
-from sglang.srt.custom_op import CustomOp
+from dinfer.custom_op_compat import CustomOp
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
     ExpertLocationDispatchInfo,
     topk_ids_logical_to_physical,
 )
-from sglang.srt.layers.moe import (
-    get_moe_runner_backend,
-    should_use_flashinfer_trtllm_moe,
-)
+try:
+    from sglang.srt.layers.moe import (
+        get_moe_runner_backend,
+        should_use_flashinfer_trtllm_moe,
+    )
+except ImportError:
+    from sglang.srt.layers.moe import get_moe_runner_backend
+
+    def should_use_flashinfer_trtllm_moe() -> bool:
+        return False
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -81,6 +87,21 @@ if _use_aiter:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
 if _is_npu:
     import torch_npu
+
+
+def _backend_is_triton_kernel(backend) -> bool:
+    fn = getattr(backend, "is_triton_kernel", None)
+    if callable(fn) and fn():
+        return True
+    fn = getattr(backend, "is_triton_kernels", None)
+    if callable(fn) and fn():
+        return True
+    return False
+
+
+def _backend_is_flashinfer_mxfp4(backend) -> bool:
+    fn = getattr(backend, "is_flashinfer_mxfp4", None)
+    return bool(callable(fn) and fn())
 
 # -------------------------------- TopKConfig ---------------------------------------
 
@@ -252,13 +273,14 @@ class TopK(CustomOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
+        backend = get_moe_runner_backend()
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
-        elif get_moe_runner_backend().is_triton_kernel():
+        elif _backend_is_triton_kernel(backend):
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif (
             should_use_flashinfer_trtllm_moe()
-            or get_moe_runner_backend().is_flashinfer_mxfp4()
+            or _backend_is_flashinfer_mxfp4(backend)
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:

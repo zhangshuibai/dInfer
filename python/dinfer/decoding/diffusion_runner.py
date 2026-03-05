@@ -10,7 +10,11 @@ from sglang.srt.utils import (
     is_hip,
 )
 import bisect
-from sglang.srt.layers.torchao_utils import save_gemlite_cache
+try:
+    from sglang.srt.layers.torchao_utils import save_gemlite_cache
+except ImportError:
+    def save_gemlite_cache():
+        return None
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tp_group,
@@ -30,7 +34,7 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
 )
 import math
-from sglang.srt.custom_op import CustomOp
+from dinfer.custom_op_compat import CustomOp
 from sglang.srt.model_executor.cuda_graph_runner import model_capture_mode
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 _is_hip = is_hip()
