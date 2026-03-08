@@ -5,6 +5,21 @@ import accelerate
 import torch
 import random
 import torch.nn.functional as F
+import csv
+
+def _patch_torch_compile_noop():
+    # Work around environments where @torch.compile on import path triggers
+    # inductor duplicate template registration.
+    def _noop_compile(fn=None, *args, **kwargs):
+        if fn is None:
+            def _decorator(f):
+                return f
+            return _decorator
+        return fn
+    torch.compile = _noop_compile
+
+_patch_torch_compile_noop()
+
 from datasets import Dataset
 from tqdm import tqdm, trange
 import accelerate
@@ -18,6 +33,7 @@ import time
 import datasets
 import os
 import pathlib
+from collections import defaultdict
 from transformers import AutoTokenizer, AutoConfig
 import torch.multiprocessing as mp
 from multiprocessing import Process
@@ -26,7 +42,9 @@ from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
 from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SGLangLM
+from dinfer.model.modeling_llada2_moe_sglang import LLaDA2SparseMoeBlock
 from dinfer.decoding.diffusion_runner import ModelRunner
+from dinfer.model.fused_moe_ec import expert_choice_routing_fused, expert_choice_fused_experts_v2
 # Removed vLLM-based model imports - not needed for SGLang backend
 # from dinfer.model import LLaDAMoeModelLM, LLaDAModelLM, LLaDA2MoeModelLM
 from dinfer import BlockIteratorFactory, KVCacheFactory
@@ -43,6 +61,172 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 bucket_size = 32
 used_buckets = []
+
+
+def _to_bool(x):
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return bool(x)
+    if isinstance(x, str):
+        return x.strip().lower() in ("1", "true", "yes", "y", "on")
+    return False
+
+
+class LayerExpertProfiler:
+    def __init__(self):
+        self._orig = {}
+        self.stats = defaultdict(lambda: {
+            "calls": 0,
+            "routing_ms_sum": 0.0,
+            "moe_ms_sum": 0.0,
+            "count_sum": None,  # torch.float64[E]
+            "count_max": None,  # torch.int64[E]
+            "est_ms_sum": None,  # torch.float64[E]
+        })
+
+    def _ensure_layer(self, layer_id, num_experts):
+        s = self.stats[layer_id]
+        if s["count_sum"] is None:
+            s["count_sum"] = torch.zeros(num_experts, dtype=torch.float64)
+            s["count_max"] = torch.zeros(num_experts, dtype=torch.int64)
+            s["est_ms_sum"] = torch.zeros(num_experts, dtype=torch.float64)
+        return s
+
+    def _record_counts(self, layer_id, num_experts, counts_cpu, routing_ms, moe_ms):
+        s = self._ensure_layer(layer_id, num_experts)
+        s["calls"] += 1
+        s["routing_ms_sum"] += float(routing_ms)
+        s["moe_ms_sum"] += float(moe_ms)
+        s["count_sum"] += counts_cpu.to(torch.float64)
+        s["count_max"] = torch.maximum(s["count_max"], counts_cpu.to(torch.int64))
+        total = float(counts_cpu.sum().item())
+        if total > 0:
+            s["est_ms_sum"] += (counts_cpu.to(torch.float64) / total) * float(moe_ms)
+
+    def install(self, model):
+        hooked = []
+        for module in model.modules():
+            if not isinstance(module, LLaDA2SparseMoeBlock):
+                continue
+            self._orig[module] = module._forward_router_experts
+            hooked.append(int(getattr(module, "layer_id", -1)))
+
+            def wrapped(this, hidden_states: torch.Tensor):
+                # Only support profiling on single GPU/TP=1 path for deterministic attribution.
+                if getattr(this, "tp_size", 1) != 1:
+                    return self._orig[this](hidden_states)
+
+                is_capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+                router_logits = this.gate(hidden_states)
+
+                if this.routing_strategy == "expert_choice":
+                    num_tokens = hidden_states.shape[0]
+                    capacity = max(1, (num_tokens * this.top_k) // this.num_experts)
+                    if is_capturing:
+                        routing_output = expert_choice_routing_fused(
+                            gating_output=router_logits, capacity=capacity, renormalize=this.norm_topk_prob
+                        )
+                        routing_ms = 0.0
+                    else:
+                        st, ed = torch.cuda.Event(True), torch.cuda.Event(True)
+                        st.record()
+                        routing_output = expert_choice_routing_fused(
+                            gating_output=router_logits, capacity=capacity, renormalize=this.norm_topk_prob
+                        )
+                        ed.record(); torch.cuda.synchronize()
+                        routing_ms = st.elapsed_time(ed)
+
+                    w1 = this.experts.w13_weight
+                    w2 = this.experts.w2_weight
+                    hidden_dim = hidden_states.shape[-1]
+                    use_triton_format = (w1.shape[1] == hidden_dim)
+                    if is_capturing:
+                        out = expert_choice_fused_experts_v2(
+                            hidden_states=hidden_states, w1=w1, w2=w2, routing_output=routing_output,
+                            activation="silu", use_triton_weight_format=use_triton_format
+                        )
+                        moe_ms = 0.0
+                    else:
+                        st2, ed2 = torch.cuda.Event(True), torch.cuda.Event(True)
+                        st2.record()
+                        out = expert_choice_fused_experts_v2(
+                            hidden_states=hidden_states, w1=w1, w2=w2, routing_output=routing_output,
+                            activation="silu", use_triton_weight_format=use_triton_format
+                        )
+                        ed2.record(); torch.cuda.synchronize()
+                        moe_ms = st2.elapsed_time(ed2)
+
+                    counts = torch.full(
+                        (this.num_experts,), routing_output.expert_tokens.shape[1],
+                        dtype=torch.int64, device=hidden_states.device
+                    )
+                    self._record_counts(this.layer_id, this.num_experts, counts.cpu(), routing_ms, moe_ms)
+                    return out
+
+                # token_choice
+                if is_capturing:
+                    topk_output = this.topk(hidden_states, router_logits)
+                    routing_ms = 0.0
+                else:
+                    st, ed = torch.cuda.Event(True), torch.cuda.Event(True)
+                    st.record(); topk_output = this.topk(hidden_states, router_logits); ed.record()
+                    torch.cuda.synchronize()
+                    routing_ms = st.elapsed_time(ed)
+                topk_ids = topk_output.topk_ids
+                valid = topk_ids >= 0
+                counts = torch.bincount(topk_ids[valid].reshape(-1), minlength=this.num_experts) if valid.any() \
+                    else torch.zeros(this.num_experts, device=hidden_states.device, dtype=torch.int64)
+
+                if is_capturing:
+                    out = this.experts(hidden_states, topk_output)
+                    moe_ms = 0.0
+                else:
+                    st2, ed2 = torch.cuda.Event(True), torch.cuda.Event(True)
+                    st2.record(); out = this.experts(hidden_states, topk_output); ed2.record()
+                    torch.cuda.synchronize()
+                    moe_ms = st2.elapsed_time(ed2)
+                self._record_counts(this.layer_id, this.num_experts, counts.cpu(), routing_ms, moe_ms)
+                return out
+
+            module._forward_router_experts = wrapped.__get__(module, module.__class__)
+        print(f"[Profiler] Installed expert hooks on {len(hooked)} layers: {sorted(hooked)}")
+
+    def uninstall(self):
+        for m, f in self._orig.items():
+            m._forward_router_experts = f
+        self._orig.clear()
+
+    def dump(self, out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        p = os.path.join(out_dir, "layer_internal_straggler.csv")
+        with open(p, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "layer_id", "active_experts", "slowest_expert_id", "slowest_est_ms",
+                "fastest_expert_id", "fastest_est_ms", "mean_est_ms", "p50_est_ms",
+                "slow_over_mean", "slow_over_fast"
+            ])
+            for layer_id in sorted(self.stats.keys()):
+                s = self.stats[layer_id]
+                calls = max(1, s["calls"])
+                avg_counts = s["count_sum"] / calls
+                est = s["est_ms_sum"] / calls
+                active = torch.nonzero(avg_counts > 0, as_tuple=False).flatten().tolist()
+                if not active:
+                    continue
+                pairs = [(e, float(est[e].item())) for e in active]
+                pairs.sort(key=lambda x: x[1])
+                vals = [x[1] for x in pairs]
+                fast_e, fast_v = pairs[0]
+                slow_e, slow_v = pairs[-1]
+                mean_v = sum(vals) / len(vals)
+                p50 = vals[len(vals) // 2]
+                w.writerow([
+                    layer_id, len(active), slow_e, slow_v, fast_e, fast_v, mean_v, p50,
+                    slow_v / max(mean_v, 1e-12), slow_v / max(fast_v, 1e-12)
+                ])
+        print(f"[Profiler] Wrote: {p}")
 
 def cut_eos(data, eos_id=156892):
     eos_indices = (data[0] == eos_id).nonzero(as_tuple=True)[0]
@@ -72,7 +256,10 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
     print("[Loading model]")
 
     from sglang.srt.layers.dp_attention import initialize_dp_attention
-    model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+    local_only = os.path.isdir(args.model_name)
+    model_config = AutoConfig.from_pretrained(
+        args.model_name, trust_remote_code=True, local_files_only=local_only
+    )
 
     # Set routing strategy (Token Choice or Expert Choice)
     routing_strategy = getattr(args, 'routing_strategy', 'token_choice')
@@ -121,7 +308,24 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
 
     input_lengths = [inp.size(-1) for inp in all_input_ids]
     max_length = max(input_lengths)+args.gen_len
-    model = ModelRunner(model, device, server_args=server_args, max_length=max_length)
+    # Enable profiler on formal evaluation path when requested.
+    profiler = None
+    if rank == 0 and _to_bool(getattr(args, "profile_experts", False)):
+        profiler = LayerExpertProfiler()
+        # Disable cuda graph while profiling so hooks execute in normal forward path.
+        use_cuda_graph = False
+    else:
+        use_cuda_graph = True
+
+    model = ModelRunner(
+        model,
+        device,
+        server_args=server_args,
+        max_length=max_length,
+        enable_cuda_graph=use_cuda_graph,
+    )
+    if profiler is not None:
+        profiler.install(model.model)
     
     batch_size = args.batch_size
 
@@ -142,6 +346,10 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
 
     else:
         cache_factory=None
+        if args.use_bd:
+            # BlockDiffusionLLM path expects KV cache. Fallback to prefix cache for robustness.
+            print("[Warning] use_bd=True with cache disabled; fallback to prefix cache.")
+            cache_factory = KVCacheFactory('prefix', is_bd_model=args.use_bd, backend='sglang', max_length=max_length)
 
     if not args.use_bd:
         if args.cont_weight>0:
@@ -299,6 +507,10 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
             # dispatch[i][j] = tokens GPU i sends to GPU j (token on i, expert on j)
             # combine[i][j] = results GPU i sends to GPU j (expert on i, token on j)
             save_communication_matrices(moe_layers_only, output_dir)
+        if profiler is not None:
+            profile_dir = getattr(args, "profile_output_dir", None) or output_dir
+            profiler.dump(profile_dir)
+            profiler.uninstall()
 
         filename = args.save_path
         with open (filename, 'w') as f:
@@ -346,6 +558,8 @@ class EvalConfig:
     enable_remask: bool = False
     routing_strategy: str = 'token_choice'
     expert_capacity: int = None
+    profile_experts: bool = False
+    profile_output_dir: str = ''
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -393,6 +607,8 @@ class DInferEvalHarness(LM):
         enable_remask = False,
         routing_strategy = 'token_choice',
         expert_capacity = None,
+        profile_experts = False,
+        profile_output_dir = '',
         **kwargs
     ):
 
@@ -401,6 +617,8 @@ class DInferEvalHarness(LM):
         self.model_path = model_path
         self.routing_strategy = routing_strategy
         self.expert_capacity = expert_capacity
+        self.profile_experts = _to_bool(profile_experts)
+        self.profile_output_dir = profile_output_dir
         self.mask_id = mask_id
         self.eos_id = eos_id
         self.mc_num = mc_num
@@ -457,7 +675,10 @@ class DInferEvalHarness(LM):
         
             
         if parallel == 'tp':
-            self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            local_only = os.path.isdir(model_path)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                model_path, trust_remote_code=True, local_files_only=local_only
+            )
         else:
             raise NotImplementedError(parallel)
         
@@ -661,7 +882,7 @@ class DInferEvalHarness(LM):
             gpus = [int(gpu) for gpu in self.gpus.split(';')]
         else:
             gpus = [0]  # fallback
-        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path, "enable_remask": self.enable_remask, "routing_strategy": self.routing_strategy, "expert_capacity": self.expert_capacity}
+        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path, "enable_remask": self.enable_remask, "routing_strategy": self.routing_strategy, "expert_capacity": self.expert_capacity, "profile_experts": self.profile_experts, "profile_output_dir": self.profile_output_dir}
         args = EvalConfig(**args)
         args.tp_size = len(gpus)
         args.master_port = self.master_port
