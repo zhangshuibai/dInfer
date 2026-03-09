@@ -5,6 +5,18 @@ import accelerate
 import torch
 import random
 import torch.nn.functional as F
+
+def _patch_torch_compile_noop():
+    def _noop_compile(fn=None, *args, **kwargs):
+        if fn is None:
+            def _decorator(f):
+                return f
+            return _decorator
+        return fn
+    torch.compile = _noop_compile
+
+_patch_torch_compile_noop()
+
 from datasets import Dataset
 from tqdm import tqdm, trange
 import accelerate
@@ -24,12 +36,67 @@ from lm_eval.api.model import LM
 from lm_eval.__main__ import cli_evaluate
 from lm_eval.api.model import LM
 from lm_eval.api.registry import register_model
-from dinfer.model import LLaDAMoeModelLM, LLaDAModelLM, LLaDA2MoeModelLM
+from dinfer.model.modeling_llada2_moe import LLaDA2MoeModelLM
+try:
+    from dinfer.model.modeling_fused_olmoe import FusedOlmoeForCausalLM as LLaDAMoeModelLM
+except Exception:
+    LLaDAMoeModelLM = None
+try:
+    from dinfer.model.modeling_llada import LLaDAModelLM
+except Exception:
+    LLaDAModelLM = None
 from dinfer import BlockIteratorFactory, KVCacheFactory
 from dinfer import ThresholdParallelDecoder,CreditThresholdParallelDecoder, HierarchyDecoder, BlockWiseDiffusionLLM, IterSmoothDiffusionLLM, VicinityCacheDiffusionLLM, IterSmoothWithVicinityCacheDiffusionLLM, BlockDiffusionLLM
-from vllm import distributed
-from vllm.config import VllmConfig, set_current_vllm_config, get_current_vllm_config
-from vllm.config import ParallelConfig
+try:
+    from vllm import distributed
+    from vllm.config import VllmConfig, set_current_vllm_config, get_current_vllm_config
+    from vllm.config import ParallelConfig
+    _HAS_VLLM = True
+except Exception:
+    _HAS_VLLM = False
+    import contextlib
+    import types
+    import torch.distributed as _torch_dist
+
+    class _DistributedCompat:
+        @staticmethod
+        def init_distributed_environment(world_size, rank, init_method, local_rank, backend):
+            if world_size <= 1:
+                return
+            if not _torch_dist.is_initialized():
+                _torch_dist.init_process_group(
+                    backend=backend, init_method=init_method, world_size=world_size, rank=rank
+                )
+
+        @staticmethod
+        def initialize_model_parallel(tp_size, backend='nccl'):
+            if tp_size > 1:
+                raise RuntimeError("vllm is required for tp_size > 1 in eval_dinfer.py")
+
+    distributed = _DistributedCompat()
+
+    class ParallelConfig:
+        def __init__(self, enable_expert_parallel=False):
+            self.enable_expert_parallel = enable_expert_parallel
+
+    class VllmConfig:
+        def __init__(self, parallel_config=None):
+            self.parallel_config = parallel_config or ParallelConfig(False)
+
+    _CURRENT_VLLM_CONFIG = VllmConfig()
+
+    @contextlib.contextmanager
+    def set_current_vllm_config(cfg):
+        global _CURRENT_VLLM_CONFIG
+        prev = _CURRENT_VLLM_CONFIG
+        _CURRENT_VLLM_CONFIG = cfg
+        try:
+            yield
+        finally:
+            _CURRENT_VLLM_CONFIG = prev
+
+    def get_current_vllm_config():
+        return _CURRENT_VLLM_CONFIG
 from dataclasses import dataclass
 
 datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
@@ -69,7 +136,6 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
 
     block_length=args.block_length
     # print()
-    from vllm import distributed
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = str(args.master_port+args.port_offset)
     distributed.init_distributed_environment(world_size, rank, 'env://', rank, 'nccl')
@@ -82,7 +148,15 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
         print("EP Enabled:", vllm_config.parallel_config.enable_expert_parallel)
 
         model_config = AutoConfig.from_pretrained(args.model_name, trust_remote_code=True)
+        model_config.routing_strategy = getattr(args, "routing_strategy", "token_choice")
+        model_config.expert_capacity = getattr(args, "expert_capacity", None)
+        print(
+            f"[Routing Strategy] {model_config.routing_strategy} "
+            f"(expert_capacity={model_config.expert_capacity})"
+        )
         if 'llada_moe' == args.model_type:
+            if LLaDAMoeModelLM is None:
+                raise ImportError("LLaDAMoeModelLM is unavailable in this environment.")
             model = LLaDAMoeModelLM(config=model_config).eval()
             model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
             print('llada_moe')
@@ -90,6 +164,8 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
             model = LLaDA2MoeModelLM(config=model_config).eval()
             model.load_weights(args.model_name, torch_dtype=torch.bfloat16)
         elif 'llada' == args.model_type:
+            if LLaDAModelLM is None:
+                raise ImportError("LLaDAModelLM is unavailable in this environment.")
             model = LLaDAModelLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16, init_device=device).eval()
         else:
             raise ValueError('model type not supported')
@@ -223,6 +299,9 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
 
             with open(args.speed_path, 'a+') as f:
                 print( args.config, args.parallel_decoding, args.threshold, args.prefix_look, args.batch_size, args.block_length, total_forward, stop-start, total_token / len(all_input_ids), total_forward/(stop-start), total_token/(stop-start), total_token/total_forward, sum(padded_gen_lens)/total_forward, np.mean(fpss), np.mean(tpss), np.mean(tpfs), file=f)
+            if hasattr(model, "dump_expert_profiling"):
+                profile_out_dir = os.getenv("DINF_PROFILE_OUT_DIR", os.path.join(args.save_dir, "profile_torch"))
+                model.dump_expert_profiling(profile_out_dir)
         return 
 
 
@@ -261,6 +340,8 @@ class EvalConfig:
     save_dir: str = './res'
     save_samples: bool = False
     speed_path: str = ''
+    routing_strategy: str = 'token_choice'
+    expert_capacity: int = None
 
 
 def set_seed(seed):
@@ -306,6 +387,8 @@ class DInferEvalHarness(LM):
         use_shift = False,
         model_type = 'llada',
         save_samples = False,
+        routing_strategy = 'token_choice',
+        expert_capacity = None,
         **kwargs
     ):
 
@@ -344,6 +427,8 @@ class DInferEvalHarness(LM):
         self.use_shift = use_shift
         self.model_type = model_type
         self.save_samples = save_samples
+        self.routing_strategy = routing_strategy
+        self.expert_capacity = expert_capacity
 
         if self.model_type == 'llada_moe':
             self.mask_id = 156895
@@ -394,6 +479,12 @@ class DInferEvalHarness(LM):
                 vllm_config = get_current_vllm_config()
                 print("EP Enabled:", vllm_config.parallel_config.enable_expert_parallel)
                 config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+                config.routing_strategy = self.routing_strategy
+                config.expert_capacity = self.expert_capacity
+                print(
+                    f"[Routing Strategy] {config.routing_strategy} "
+                    f"(expert_capacity={config.expert_capacity})"
+                )
                 # load model
                 if self.model_type == 'llada_moe':
                     self.model = LLaDAMoeModelLM(config=config).eval()
@@ -694,8 +785,16 @@ class DInferEvalHarness(LM):
         elif self.parallel == 'tp':
             procs = []
             answers = []
-            gpus = [int(gpu) for gpu in self.gpus.split(';')]
-            args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "mask_id": self.mask_id, "eos_id": self.eos_id, "save_dir": self.save_dir, "save_samples": self.save_samples, "speed_path": self.speed_path}
+            if isinstance(self.gpus, int):
+                gpus = [self.gpus]
+            elif isinstance(self.gpus, (list, tuple)):
+                gpus = [int(gpu) for gpu in self.gpus]
+            elif isinstance(self.gpus, str):
+                sep = ';' if ';' in self.gpus else ','
+                gpus = [int(gpu.strip()) for gpu in self.gpus.split(sep) if gpu.strip() != ""]
+            else:
+                raise ValueError(f"Unsupported gpus type: {type(self.gpus)}")
+            args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "mask_id": self.mask_id, "eos_id": self.eos_id, "save_dir": self.save_dir, "save_samples": self.save_samples, "speed_path": self.speed_path, "routing_strategy": self.routing_strategy, "expert_capacity": self.expert_capacity}
             args = EvalConfig(**args)
             args.tp_size = len(gpus)
             args.master_port = self.master_port

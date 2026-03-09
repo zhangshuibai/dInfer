@@ -74,7 +74,8 @@ def _to_bool(x):
 
 
 class LayerExpertProfiler:
-    def __init__(self):
+    def __init__(self, profile_mode: str = "estimate"):
+        self.profile_mode = profile_mode
         self._orig = {}
         self.stats = defaultdict(lambda: {
             "calls": 0,
@@ -83,6 +84,7 @@ class LayerExpertProfiler:
             "count_sum": None,  # torch.float64[E]
             "count_max": None,  # torch.int64[E]
             "est_ms_sum": None,  # torch.float64[E]
+            "exact_ms_sum": None,  # torch.float64[E]
         })
 
     def _ensure_layer(self, layer_id, num_experts):
@@ -91,6 +93,7 @@ class LayerExpertProfiler:
             s["count_sum"] = torch.zeros(num_experts, dtype=torch.float64)
             s["count_max"] = torch.zeros(num_experts, dtype=torch.int64)
             s["est_ms_sum"] = torch.zeros(num_experts, dtype=torch.float64)
+            s["exact_ms_sum"] = torch.zeros(num_experts, dtype=torch.float64)
         return s
 
     def _record_counts(self, layer_id, num_experts, counts_cpu, routing_ms, moe_ms):
@@ -103,6 +106,78 @@ class LayerExpertProfiler:
         total = float(counts_cpu.sum().item())
         if total > 0:
             s["est_ms_sum"] += (counts_cpu.to(torch.float64) / total) * float(moe_ms)
+
+    def _record_exact_ms(self, layer_id, num_experts, exact_ms_cpu):
+        s = self._ensure_layer(layer_id, num_experts)
+        s["exact_ms_sum"] += exact_ms_cpu.to(torch.float64)
+
+    def _profile_exact_torch_ec(self, this, hidden_states, routing_output):
+        E = this.num_experts
+        exact_ms = torch.zeros(E, dtype=torch.float64)
+        w1 = this.experts.w13_weight
+        w2 = this.experts.w2_weight
+        use_triton_format = (w1.shape[1] == hidden_states.shape[-1])
+        expert_tokens = routing_output.expert_tokens
+        expert_weights = routing_output.expert_weights
+
+        for e in range(E):
+            token_indices = expert_tokens[e].long()
+            weights = expert_weights[e]
+            if token_indices.numel() == 0:
+                continue
+            x = hidden_states[token_indices]
+            st, ed = torch.cuda.Event(True), torch.cuda.Event(True)
+            st.record()
+            if use_triton_format:
+                gate_up = x @ w1[e]
+            else:
+                gate_up = x @ w1[e].t()
+            mid = gate_up.shape[-1] // 2
+            activated = torch.nn.functional.silu(gate_up[:, :mid]) * gate_up[:, mid:]
+            if use_triton_format:
+                y = activated @ w2[e]
+            else:
+                y = activated @ w2[e].t()
+            _ = y * weights.unsqueeze(-1).to(y.dtype)
+            ed.record()
+            torch.cuda.synchronize()
+            exact_ms[e] += float(st.elapsed_time(ed))
+        self._record_exact_ms(this.layer_id, E, exact_ms)
+
+    def _profile_exact_torch_tc(self, this, hidden_states, topk_output):
+        E = this.num_experts
+        exact_ms = torch.zeros(E, dtype=torch.float64)
+        topk_ids = topk_output.topk_ids
+        topk_weights = topk_output.topk_weights
+        w1 = this.experts.w13_weight
+        w2 = this.experts.w2_weight
+        use_triton_format = (w1.shape[1] == hidden_states.shape[-1])
+
+        for e in range(E):
+            pos = (topk_ids == e).nonzero(as_tuple=False)
+            if pos.numel() == 0:
+                continue
+            token_indices = pos[:, 0].long()
+            slot_indices = pos[:, 1].long()
+            x = hidden_states[token_indices]
+            weights = topk_weights[token_indices, slot_indices]
+            st, ed = torch.cuda.Event(True), torch.cuda.Event(True)
+            st.record()
+            if use_triton_format:
+                gate_up = x @ w1[e]
+            else:
+                gate_up = x @ w1[e].t()
+            mid = gate_up.shape[-1] // 2
+            activated = torch.nn.functional.silu(gate_up[:, :mid]) * gate_up[:, mid:]
+            if use_triton_format:
+                y = activated @ w2[e]
+            else:
+                y = activated @ w2[e].t()
+            _ = y * weights.unsqueeze(-1).to(y.dtype)
+            ed.record()
+            torch.cuda.synchronize()
+            exact_ms[e] += float(st.elapsed_time(ed))
+        self._record_exact_ms(this.layer_id, E, exact_ms)
 
     def install(self, model):
         hooked = []
@@ -162,6 +237,8 @@ class LayerExpertProfiler:
                         dtype=torch.int64, device=hidden_states.device
                     )
                     self._record_counts(this.layer_id, this.num_experts, counts.cpu(), routing_ms, moe_ms)
+                    if self.profile_mode == "exact_torch":
+                        self._profile_exact_torch_ec(this, hidden_states, routing_output)
                     return out
 
                 # token_choice
@@ -187,10 +264,15 @@ class LayerExpertProfiler:
                     torch.cuda.synchronize()
                     moe_ms = st2.elapsed_time(ed2)
                 self._record_counts(this.layer_id, this.num_experts, counts.cpu(), routing_ms, moe_ms)
+                if self.profile_mode == "exact_torch":
+                    self._profile_exact_torch_tc(this, hidden_states, topk_output)
                 return out
 
             module._forward_router_experts = wrapped.__get__(module, module.__class__)
-        print(f"[Profiler] Installed expert hooks on {len(hooked)} layers: {sorted(hooked)}")
+        print(
+            f"[Profiler] Installed expert hooks on {len(hooked)} layers: {sorted(hooked)} "
+            f"(mode={self.profile_mode})"
+        )
 
     def uninstall(self):
         for m, f in self._orig.items():
@@ -200,6 +282,7 @@ class LayerExpertProfiler:
     def dump(self, out_dir):
         os.makedirs(out_dir, exist_ok=True)
         p = os.path.join(out_dir, "layer_internal_straggler.csv")
+        pe = os.path.join(out_dir, "expert_summary.csv")
         with open(p, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
@@ -212,10 +295,12 @@ class LayerExpertProfiler:
                 calls = max(1, s["calls"])
                 avg_counts = s["count_sum"] / calls
                 est = s["est_ms_sum"] / calls
+                exact = s["exact_ms_sum"] / calls
+                values = exact if self.profile_mode == "exact_torch" else est
                 active = torch.nonzero(avg_counts > 0, as_tuple=False).flatten().tolist()
                 if not active:
                     continue
-                pairs = [(e, float(est[e].item())) for e in active]
+                pairs = [(e, float(values[e].item())) for e in active]
                 pairs.sort(key=lambda x: x[1])
                 vals = [x[1] for x in pairs]
                 fast_e, fast_v = pairs[0]
@@ -226,7 +311,39 @@ class LayerExpertProfiler:
                     layer_id, len(active), slow_e, slow_v, fast_e, fast_v, mean_v, p50,
                     slow_v / max(mean_v, 1e-12), slow_v / max(fast_v, 1e-12)
                 ])
+        with open(pe, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(
+                [
+                    "layer_id",
+                    "expert_id",
+                    "avg_assignments",
+                    "max_assignments",
+                    "est_ms",
+                    "exact_ms",
+                ]
+            )
+            for layer_id in sorted(self.stats.keys()):
+                s = self.stats[layer_id]
+                calls = max(1, s["calls"])
+                avg_counts = s["count_sum"] / calls
+                est = s["est_ms_sum"] / calls
+                exact = s["exact_ms_sum"] / calls
+                for e in range(avg_counts.shape[0]):
+                    if avg_counts[e] <= 0:
+                        continue
+                    w.writerow(
+                        [
+                            layer_id,
+                            e,
+                            float(avg_counts[e].item()),
+                            int(s["count_max"][e].item()),
+                            float(est[e].item()),
+                            float(exact[e].item()),
+                        ]
+                    )
         print(f"[Profiler] Wrote: {p}")
+        print(f"[Profiler] Wrote: {pe}")
 
 def cut_eos(data, eos_id=156892):
     eos_indices = (data[0] == eos_id).nonzero(as_tuple=True)[0]
@@ -311,7 +428,11 @@ def run_benchmark(world_size, rank, gpu_id, tokenizer, args):
     # Enable profiler on formal evaluation path when requested.
     profiler = None
     if rank == 0 and _to_bool(getattr(args, "profile_experts", False)):
-        profiler = LayerExpertProfiler()
+        profile_mode = str(getattr(args, "profile_mode", "estimate")).strip().lower()
+        if profile_mode not in ("estimate", "exact_torch"):
+            print(f"[Profiler] Unknown profile_mode={profile_mode}, fallback to estimate")
+            profile_mode = "estimate"
+        profiler = LayerExpertProfiler(profile_mode=profile_mode)
         # Disable cuda graph while profiling so hooks execute in normal forward path.
         use_cuda_graph = False
     else:
@@ -560,6 +681,7 @@ class EvalConfig:
     expert_capacity: int = None
     profile_experts: bool = False
     profile_output_dir: str = ''
+    profile_mode: str = 'estimate'
 
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -609,6 +731,7 @@ class DInferEvalHarness(LM):
         expert_capacity = None,
         profile_experts = False,
         profile_output_dir = '',
+        profile_mode = 'estimate',
         **kwargs
     ):
 
@@ -619,6 +742,7 @@ class DInferEvalHarness(LM):
         self.expert_capacity = expert_capacity
         self.profile_experts = _to_bool(profile_experts)
         self.profile_output_dir = profile_output_dir
+        self.profile_mode = str(profile_mode)
         self.mask_id = mask_id
         self.eos_id = eos_id
         self.mc_num = mc_num
@@ -882,7 +1006,7 @@ class DInferEvalHarness(LM):
             gpus = [int(gpu) for gpu in self.gpus.split(';')]
         else:
             gpus = [0]  # fallback
-        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path, "enable_remask": self.enable_remask, "routing_strategy": self.routing_strategy, "expert_capacity": self.expert_capacity, "profile_experts": self.profile_experts, "profile_output_dir": self.profile_output_dir}
+        args = {"gpu": gpus, "batch_size": self.batch_size, "model_name": self.model_path, "gen_len": self.gen_length, "block_length": self.block_length, "prefix_look": self.prefix_look, "after_look": self.after_look, "warmup_times": self.warmup_times, "low_threshold": self.low_threshold, "threshold": self.threshold, "cont_weight": self.cont_weight, "use_credit": self.use_credit, "cache": self.cache, "parallel_decoding": self.parallel_decoding, "tp_size": self.tp_size, "save_path": self.save_path, "use_cudagraph": self.use_cudagraph, "use_compile": self.use_compile,"use_bd": self.use_bd, "use_shift": self.use_shift, "model_type": self.model_type, "vocab_size": self.vocab_size, "batch_size": self.batch_size, "speed_path": self.speed_path, "enable_remask": self.enable_remask, "routing_strategy": self.routing_strategy, "expert_capacity": self.expert_capacity, "profile_experts": self.profile_experts, "profile_output_dir": self.profile_output_dir, "profile_mode": self.profile_mode}
         args = EvalConfig(**args)
         args.tp_size = len(gpus)
         args.master_port = self.master_port

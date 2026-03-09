@@ -34,6 +34,7 @@ save_samples=False # save samples
 routing_strategy='token_choice' # 'token_choice' (default) or 'expert_choice' for Expert Choice routing
 expert_capacity='' # capacity per expert for expert_choice (leave empty for auto: n*top_k/num_experts)
 profile_experts=True # whether to output layer-internal expert straggler profile
+profile_mode='exact_torch' # estimate | exact_torch
 profile_output_dir="${output_dir}/profile_${routing_strategy}" # csv output dir for profiling
 limit=5 # number of samples to run (single-card profiling default)
 # for llada 1.5 use tasks gsm8k_llada1.5 mbpp_sanitized_llada1.5
@@ -43,7 +44,7 @@ if [ "${parallel}" = "tp" ]; then
     output_path=${output_dir}/${task}
     python eval_dinfer_sglang.py --tasks ${task} \
     --confirm_run_unsafe_code --model dInfer_eval \
-    --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},prefix_look=${prefix_look},after_look=${after_look},gpus=${gpus},model_type=${model_type},use_bd=${use_bd},master_port=${master_port},save_samples=${save_samples},routing_strategy=${routing_strategy},profile_experts=${profile_experts},profile_output_dir=${profile_output_dir}${expert_capacity:+,expert_capacity=${expert_capacity}} \
+    --model_args model_path=${model_path},gen_length=${length},block_length=${block_length},threshold=${threshold},low_threshold=${low_threshold},show_speed=True,save_dir=${output_path},parallel_decoding=${parallel_decoding},cache=${cache},warmup_times=${warmup_times},use_compile=${use_compile},tp_size=${tp_size},parallel=${parallel},cont_weight=${cont_weight},use_credit=${use_credit},prefix_look=${prefix_look},after_look=${after_look},gpus=${gpus},model_type=${model_type},use_bd=${use_bd},master_port=${master_port},save_samples=${save_samples},routing_strategy=${routing_strategy},profile_experts=${profile_experts},profile_mode=${profile_mode},profile_output_dir=${profile_output_dir}${expert_capacity:+,expert_capacity=${expert_capacity}} \
     --output_path ${output_path} --include_path "$(pwd)/tasks" --apply_chat_template ${limit:+--limit ${limit}}
   done
 else
